@@ -2,8 +2,10 @@
 # 因为官方 API SDK 写的真是太 TM 狗屎了
 import lighter
 import datetime
-import requests
 import asyncio
+import math
+import warnings
+import aiohttp
 
 from lighter.signer_client import CreateOrderTxReq
 
@@ -30,6 +32,8 @@ class LighterWrapper:
         self._order_api = lighter.OrderApi(self.api_client)
 
         self.request_headers = {"Content-Type": "application/json"}
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._http_timeout = aiohttp.ClientTimeout(total=10)
 
         self.books_metadatas_cache = dict()  # 订单簿元数据缓存 用于加速获取 market_id 和 换算精度
                                              # {"symbol": {...}, ...}
@@ -55,7 +59,17 @@ class LighterWrapper:
             size_decimals = books_metadata["order_books"][0]["supported_size_decimals"]
             self.books_metadatas_cache[symbol] = books_metadata["order_books"][0] # 添加缓存
             
-        return int(amount * (10 ** size_decimals)) # 根据精度缩放数量
+        scaled = amount * (10 ** size_decimals)
+        rounded = round(scaled)
+        # 最小精度检测：如果不是可用精度的整数倍，给出 Warning 并抛弃小数点
+        if not math.isclose(scaled, rounded, rel_tol=0.0, abs_tol=1e-6):
+            min_step = 10 ** (-size_decimals)
+            warnings.warn(
+                f"amount 精度超限，最小步进 {min_step}，传入 {amount}；已截断至最小精度",
+                RuntimeWarning,
+            )
+            return int(scaled)
+        return int(rounded) # 根据精度缩放数量
 
     async def _resize_price(self, symbol: str, price: float) -> int:
         if symbol in list(self.books_metadatas_cache.keys()):
@@ -65,11 +79,23 @@ class LighterWrapper:
             price_decimals = books_metadata["order_books"][0]["supported_price_decimals"]
             self.books_metadatas_cache[symbol] = books_metadata["order_books"][0] # 添加缓存
 
-        return int(price * (10 ** price_decimals)) # 根据精度缩放价格
+        scaled = price * (10 ** price_decimals)
+        rounded = round(scaled)
+        # 最小精度检测：如果不是可用精度的整数倍，给出 Warning 并抛弃小数点
+        if not math.isclose(scaled, rounded, rel_tol=0.0, abs_tol=1e-6):
+            min_step = 10 ** (-price_decimals)
+            warnings.warn(
+                f"price 精度超限，最小步进 {min_step}，传入 {price}；已截断至最小精度",
+                RuntimeWarning,
+            )
+            return int(scaled)
+        return int(rounded) # 根据精度缩放价格
 
     async def _close(self):
         await self.api_client.close()
         await self.signer_instance.close()
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
 
     def _get_auth_token(self) -> Optional[str]:
         """
@@ -83,6 +109,20 @@ class LighterWrapper:
             return auth
         except Exception:
             return None
+
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession(timeout=self._http_timeout)
+        return self._http_session
+
+    async def _http_get_json(self, path: str) -> dict:
+        session = await self._get_http_session()
+        url = self.config.base_url + path
+        async with session.get(url, headers=self.request_headers) as response:
+            if response.status == 200:
+                return await response.json()
+            text = await response.text()
+            raise Exception(f"Failed to fetch: {response.status} {text}")
 
     @staticmethod
     def _tuple_to_dict(res_tuple):
@@ -169,12 +209,7 @@ class LighterWrapper:
         """
         # 手动封装获取账户余额
         path = f"/api/v1/account?by=index&value={self.config.account_index}"
-        url = self.config.base_url + path
-        response = requests.get(url, headers=self.request_headers, timeout=10)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            raise Exception(f"Failed to fetch account: {response.status_code}")
+        return await self._http_get_json(path)
 
     async def fetch_ohlcv(self, symbol: str, resolution: str = "1m", limit: int = 200, count_back: int = 0) -> dict:
         """
@@ -196,13 +231,7 @@ class LighterWrapper:
         start_timestamp = end_timestamp - limit * self._resolution_to_seconds(resolution)
 
         path = f"/api/v1/candles?market_id={market_id}&resolution={resolution}&start_timestamp={start_timestamp}&end_timestamp={end_timestamp}&count_back={count_back}"
-        url = self.config.base_url + path
-
-        response = requests.get(url, headers=self.request_headers, timeout=10)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            raise Exception(f"Failed to fetch ohlcv: {response.status_code}")
+        return await self._http_get_json(path)
 
     async def get_order_books_metadata(self, symbol: str) -> dict:
         """
