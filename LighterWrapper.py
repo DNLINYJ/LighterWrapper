@@ -61,7 +61,7 @@ class LighterWrapper:
         return mapping.get(resolution, 60)  # 默认返回 1 分钟
 
     async def _resize_amount(self, symbol: str, amount: float) -> int:
-        if symbol in list(self.books_metadatas_cache.keys()):
+        if symbol in self.books_metadatas_cache:
             size_decimals = self.books_metadatas_cache[symbol]["supported_size_decimals"]
         else:
             books_metadata = await self.get_order_books_metadata(symbol)
@@ -81,7 +81,7 @@ class LighterWrapper:
         return int(rounded) # 根据精度缩放数量
 
     async def _resize_price(self, symbol: str, price: float) -> int:
-        if symbol in list(self.books_metadatas_cache.keys()):
+        if symbol in self.books_metadatas_cache:
             price_decimals = self.books_metadatas_cache[symbol]["supported_price_decimals"]
         else:
             books_metadata = await self.get_order_books_metadata(symbol)
@@ -834,7 +834,7 @@ class LighterWrapper:
         """
         get_symbol_price_decimals: 获取指定交易对的价格精度
         """
-        if symbol in list(self.books_metadatas_cache.keys()):
+        if symbol in self.books_metadatas_cache:
             return int(self.books_metadatas_cache[symbol]["supported_price_decimals"])
         books_metadata = await self.get_order_books_metadata(symbol)
         price_decimals = books_metadata["order_books"][0]["supported_price_decimals"]
@@ -845,7 +845,7 @@ class LighterWrapper:
         """
         get_symbol_size_decimals: 获取指定交易对的数量精度
         """
-        if symbol in list(self.books_metadatas_cache.keys()):
+        if symbol in self.books_metadatas_cache:
             return int(self.books_metadatas_cache[symbol]["supported_size_decimals"])
         books_metadata = await self.get_order_books_metadata(symbol)
         size_decimals = books_metadata["order_books"][0]["supported_size_decimals"]
