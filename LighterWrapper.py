@@ -5,6 +5,10 @@ import datetime
 import asyncio
 import math
 import warnings
+import time
+import uuid
+import json
+import sqlite3
 import aiohttp
 
 from lighter.signer_client import CreateOrderTxReq
@@ -34,6 +38,11 @@ class LighterWrapper:
         self.request_headers = {"Content-Type": "application/json"}
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._http_timeout = aiohttp.ClientTimeout(total=10)
+        self._virtual_orders: Dict[str, dict] = {}
+        self._db_path = f"{self.config.account_index}.db"
+        self._init_virtual_orders_db()
+        self._load_virtual_orders()
+        self._reconcile_task: Optional[asyncio.Task] = None
 
         self.books_metadatas_cache = dict()  # 订单簿元数据缓存 用于加速获取 market_id 和 换算精度
                                              # {"symbol": {...}, ...}
@@ -92,6 +101,12 @@ class LighterWrapper:
         return int(rounded) # 根据精度缩放价格
 
     async def _close(self):
+        if self._reconcile_task and not self._reconcile_task.done():
+            self._reconcile_task.cancel()
+            try:
+                await self._reconcile_task
+            except asyncio.CancelledError:
+                pass
         await self.api_client.close()
         await self.signer_instance.close()
         if self._http_session and not self._http_session.closed:
@@ -109,6 +124,557 @@ class LighterWrapper:
             return auth
         except Exception:
             return None
+
+    def _init_virtual_orders_db(self) -> None:
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS virtual_orders (
+                    virtual_order_id TEXT PRIMARY KEY,
+                    account_index INTEGER NOT NULL,
+                    status TEXT,
+                    created_at_ms INTEGER,
+                    updated_at_ms INTEGER,
+                    data_json TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_virtual_orders_status ON virtual_orders(status)"
+            )
+        finally:
+            conn.close()
+
+    def _load_virtual_orders(self) -> None:
+        conn = sqlite3.connect(self._db_path)
+        try:
+            cursor = conn.execute(
+                "SELECT virtual_order_id, data_json FROM virtual_orders"
+            )
+            for virtual_order_id, data_json in cursor.fetchall():
+                try:
+                    self._virtual_orders[virtual_order_id] = json.loads(data_json)
+                except Exception:
+                    continue
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _json_default(obj):
+        if hasattr(obj, "to_dict"):
+            try:
+                return obj.to_dict()
+            except Exception:
+                pass
+        if hasattr(obj, "model_dump"):
+            try:
+                return obj.model_dump()
+            except Exception:
+                pass
+        if isinstance(obj, set):
+            return list(obj)
+        return str(obj)
+
+    def _persist_virtual_order(self, virtual_order_id: str) -> None:
+        data = self._virtual_orders.get(virtual_order_id)
+        if data is None:
+            return
+        now_ms = int(time.time() * 1000)
+        if data.get("created_at_ms") is None:
+            data["created_at_ms"] = now_ms
+        data["updated_at_ms"] = now_ms
+        status = data.get("status")
+        data_json = json.dumps(data, ensure_ascii=False, default=self._json_default)
+
+        conn = sqlite3.connect(self._db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO virtual_orders (
+                    virtual_order_id,
+                    account_index,
+                    status,
+                    created_at_ms,
+                    updated_at_ms,
+                    data_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(virtual_order_id) DO UPDATE SET
+                    status=excluded.status,
+                    updated_at_ms=excluded.updated_at_ms,
+                    data_json=excluded.data_json
+                """,
+                (
+                    virtual_order_id,
+                    self.config.account_index,
+                    status,
+                    data.get("created_at_ms"),
+                    data.get("updated_at_ms"),
+                    data_json,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _generate_virtual_order_id(self) -> str:
+        return f"v-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+
+    def get_virtual_order(self, virtual_order_id: str) -> Optional[dict]:
+        return self._virtual_orders.get(virtual_order_id)
+
+    def list_virtual_orders(self) -> dict:
+        return dict(self._virtual_orders)
+
+    @staticmethod
+    def _get_order_field(order: dict, *keys):
+        for key in keys:
+            if key in order and order[key] is not None:
+                return order[key]
+        return None
+
+    def _normalize_side(self, order: dict) -> Optional[str]:
+        side = self._get_order_field(order, "side")
+        if isinstance(side, str):
+            s = side.lower()
+            if s in ("buy", "sell"):
+                return s
+        if side is not None:
+            try:
+                return "sell" if int(side) == 1 else "buy"
+            except Exception:
+                pass
+        is_ask = self._get_order_field(order, "is_ask", "IsAsk")
+        if is_ask is not None:
+            try:
+                return "sell" if int(is_ask) == 1 else "buy"
+            except Exception:
+                pass
+        return None
+
+    def _normalize_reduce_only(self, order: dict) -> Optional[bool]:
+        reduce_only = self._get_order_field(order, "reduce_only", "reduceOnly", "ReduceOnly")
+        if reduce_only is None:
+            return None
+        try:
+            return bool(int(reduce_only))
+        except Exception:
+            return bool(reduce_only)
+
+    def _normalize_order_type(self, order: dict):
+        order_type = self._get_order_field(order, "order_type", "orderType", "type", "Type")
+        if isinstance(order_type, str):
+            return order_type.lower()
+        return order_type
+
+    @staticmethod
+    def _extract_timestamp_ms(order: dict) -> Optional[int]:
+        ts = None
+        for key in (
+            "created_at",
+            "createdAt",
+            "created_time",
+            "createdTime",
+            "timestamp",
+            "ts",
+        ):
+            if key in order and order[key] is not None:
+                ts = order[key]
+                break
+        if ts is None:
+            return None
+        try:
+            ts_int = int(ts)
+        except Exception:
+            return None
+        if ts_int < 10**12:
+            ts_int *= 1000
+        return ts_int
+
+    @staticmethod
+    def _order_unique_key(order: dict) -> str:
+        for key in ("order_index", "orderIndex", "order_id", "orderId", "id"):
+            if key in order and order[key] is not None:
+                return str(order[key])
+        return f"noid-{hash(json.dumps(order, sort_keys=True, ensure_ascii=False))}"
+
+    @staticmethod
+    def _order_min_view(order: dict) -> dict:
+        view = {}
+        for key in (
+            "order_index",
+            "orderIndex",
+            "order_id",
+            "orderId",
+            "id",
+            "symbol",
+            "price",
+            "Price",
+            "trigger_price",
+            "TriggerPrice",
+            "side",
+            "is_ask",
+            "reduce_only",
+            "order_type",
+            "type",
+            "status",
+        ):
+            if key in order:
+                view[key] = order[key]
+        if "_source" in order:
+            view["_source"] = order["_source"]
+        return view
+
+    @staticmethod
+    def _order_type_matches(actual, expected_types) -> bool:
+        if actual is None:
+            return False
+        if isinstance(actual, str):
+            actual_str = actual.lower()
+            for expected in expected_types:
+                if isinstance(expected, str) and expected in actual_str:
+                    return True
+            return False
+        try:
+            actual_int = int(actual)
+        except Exception:
+            return False
+        for expected in expected_types:
+            try:
+                if int(expected) == actual_int:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _price_matches(actual, expected_int: Optional[int], expected_float: Optional[float], step: float) -> bool:
+        if actual is None:
+            return True
+        try:
+            value = float(actual)
+        except Exception:
+            return True
+        if expected_int is not None and abs(value - expected_int) <= 1:
+            return True
+        if expected_float is not None and abs(value - expected_float) <= step * 2:
+            return True
+        return False
+
+    def _build_expected_suborders(self, virtual_order: dict, include_entry: bool) -> list:
+        side = virtual_order.get("side")
+        if side == "buy":
+            opposite = "sell"
+        else:
+            opposite = "buy"
+
+        expected = []
+
+        if virtual_order.get("order_type") in ("market_with_tp_sl", "limit_with_tp_sl"):
+            expected.append(
+                {
+                    "kind": "tp",
+                    "side": opposite,
+                    "reduce_only": True,
+                    "order_types": {
+                        self.signer_instance.ORDER_TYPE_TAKE_PROFIT_LIMIT,
+                        "take_profit",
+                        "take_profit_limit",
+                        "tp_limit",
+                    },
+                    "price_int": virtual_order.get("tp_price_int"),
+                    "price": virtual_order.get("worst_tp_price"),
+                    "trigger_int": virtual_order.get("tp_trigger_price_int"),
+                    "trigger": virtual_order.get("take_profit_price"),
+                }
+            )
+            expected.append(
+                {
+                    "kind": "sl",
+                    "side": opposite,
+                    "reduce_only": True,
+                    "order_types": {
+                        self.signer_instance.ORDER_TYPE_STOP_LOSS_LIMIT,
+                        "stop_loss",
+                        "stop_loss_limit",
+                        "sl_limit",
+                    },
+                    "price_int": virtual_order.get("sl_price_int"),
+                    "price": virtual_order.get("worst_sl_price"),
+                    "trigger_int": virtual_order.get("sl_trigger_price_int"),
+                    "trigger": virtual_order.get("stop_loss_price"),
+                }
+            )
+
+            if include_entry:
+                entry_types = {
+                    self.signer_instance.ORDER_TYPE_MARKET,
+                    "market",
+                }
+                if virtual_order.get("order_type") == "limit_with_tp_sl":
+                    entry_types = {
+                        self.signer_instance.ORDER_TYPE_LIMIT,
+                        "limit",
+                    }
+                expected.append(
+                    {
+                        "kind": "entry",
+                        "side": side,
+                        "reduce_only": False,
+                        "order_types": entry_types,
+                        "price_int": virtual_order.get("entry_price_int"),
+                        "price": virtual_order.get("price"),
+                    }
+                )
+
+        return expected
+
+    def _find_best_match(
+        self,
+        orders: list,
+        used_keys: set,
+        expected: dict,
+        price_step: float,
+        match_window_ms: int,
+        created_at_ms: Optional[int],
+    ) -> Optional[dict]:
+        best = None
+        best_score = None
+
+        for order in orders:
+            key = self._order_unique_key(order)
+            if key in used_keys:
+                continue
+
+            actual_side = self._normalize_side(order)
+            expected_side = expected.get("side")
+            if actual_side is not None and expected_side is not None and actual_side != expected_side:
+                continue
+
+            actual_reduce_only = self._normalize_reduce_only(order)
+            expected_reduce_only = expected.get("reduce_only")
+            if actual_reduce_only is not None and expected_reduce_only is not None:
+                if actual_reduce_only != expected_reduce_only:
+                    continue
+
+            actual_order_type = self._normalize_order_type(order)
+            expected_types = expected.get("order_types")
+            if actual_order_type is not None and expected_types is not None:
+                if not self._order_type_matches(actual_order_type, expected_types):
+                    continue
+
+            if expected.get("price_int") is not None or expected.get("price") is not None:
+                actual_price = self._get_order_field(order, "price", "Price", "limit_price", "limitPrice")
+                if not self._price_matches(
+                    actual_price,
+                    expected.get("price_int"),
+                    expected.get("price"),
+                    price_step,
+                ):
+                    continue
+
+            if expected.get("trigger_int") is not None or expected.get("trigger") is not None:
+                actual_trigger = self._get_order_field(order, "trigger_price", "TriggerPrice", "triggerPrice")
+                if not self._price_matches(
+                    actual_trigger,
+                    expected.get("trigger_int"),
+                    expected.get("trigger"),
+                    price_step,
+                ):
+                    continue
+
+            if created_at_ms is not None:
+                actual_ts = self._extract_timestamp_ms(order)
+                if actual_ts is not None and abs(actual_ts - created_at_ms) > match_window_ms:
+                    continue
+
+            # Match score: smaller is better
+            score = 0
+            if actual_side is None:
+                score += 1
+            if actual_reduce_only is None:
+                score += 1
+            if actual_order_type is None:
+                score += 1
+
+            actual_price = self._get_order_field(order, "price", "Price", "limit_price", "limitPrice")
+            if actual_price is not None and expected.get("price") is not None:
+                try:
+                    score += abs(float(actual_price) - float(expected.get("price"))) / max(price_step, 1e-9)
+                except Exception:
+                    score += 1
+
+            actual_trigger = self._get_order_field(order, "trigger_price", "TriggerPrice", "triggerPrice")
+            if actual_trigger is not None and expected.get("trigger") is not None:
+                try:
+                    score += abs(float(actual_trigger) - float(expected.get("trigger"))) / max(price_step, 1e-9)
+                except Exception:
+                    score += 1
+
+            if best is None or score < best_score:
+                best = order
+                best_score = score
+
+        if best is None:
+            return None
+
+        best_view = self._order_min_view(best)
+        best_view["_match_key"] = self._order_unique_key(best)
+        return best_view
+
+    async def reconcile_virtual_orders(
+        self,
+        symbols: Optional[list] = None,
+        include_closed: bool = True,
+        closed_limit: int = 100,
+        include_entry: bool = False,
+        match_window_sec: int = 300,
+    ) -> dict:
+        """
+        reconcile_virtual_orders: 虚拟单与实际订单自动匹配
+
+        参数:
+            symbols: 仅匹配指定交易对列表
+            include_closed: 是否包含已完成/已取消订单
+            closed_limit: 已完成订单拉取数量
+            include_entry: 是否尝试匹配入场单
+            match_window_sec: 订单创建时间匹配窗口（秒）
+        """
+        active_orders = {
+            vid: vo
+            for vid, vo in self._virtual_orders.items()
+            if vo.get("status") in ("created", "submitted", "matched_partial")
+        }
+        if not active_orders:
+            return {"total": 0, "updated": 0, "matched": 0}
+
+        if symbols is None:
+            symbols = sorted(
+                {vo.get("symbol") for vo in active_orders.values() if vo.get("symbol")}
+            )
+
+        actual_orders_by_symbol = {}
+        for symbol in symbols:
+            open_res = await self.fetch_open_orders(symbol)
+            orders = open_res.get("orders") or []
+            for order in orders:
+                order["_source"] = "open"
+
+            if include_closed:
+                closed_res = await self.fetch_closed_orders(symbol=symbol, limit=closed_limit)
+                closed_orders = closed_res.get("orders") or []
+                for order in closed_orders:
+                    order["_source"] = "closed"
+                orders.extend(closed_orders)
+
+            actual_orders_by_symbol[symbol] = orders
+
+        price_steps = {}
+        for symbol in symbols:
+            decimals = await self.get_symbol_price_decimals(symbol)
+            price_steps[symbol] = 10 ** (-decimals)
+
+        used_keys = {symbol: set() for symbol in symbols}
+
+        updated = 0
+        matched_total = 0
+        match_window_ms = match_window_sec * 1000
+
+        for virtual_order_id, virtual_order in active_orders.items():
+            symbol = virtual_order.get("symbol")
+            if symbol not in actual_orders_by_symbol:
+                continue
+
+            expected_orders = self._build_expected_suborders(
+                virtual_order, include_entry=include_entry
+            )
+            if not expected_orders:
+                continue
+
+            matched = []
+            for expected in expected_orders:
+                match = self._find_best_match(
+                    actual_orders_by_symbol[symbol],
+                    used_keys[symbol],
+                    expected,
+                    price_steps[symbol],
+                    match_window_ms,
+                    virtual_order.get("created_at_ms"),
+                )
+                if match:
+                    used_keys[symbol].add(match["_match_key"])
+                    matched.append(match)
+
+            if matched:
+                virtual_order["actual_orders"] = matched
+                expected_count = virtual_order.get("expected_order_count", len(expected_orders))
+                if len(matched) >= expected_count:
+                    virtual_order["status"] = "matched"
+                else:
+                    virtual_order["status"] = "matched_partial"
+                self._persist_virtual_order(virtual_order_id)
+                updated += 1
+                matched_total += len(matched)
+
+        return {"total": len(active_orders), "updated": updated, "matched": matched_total}
+
+    async def _reconcile_loop(
+        self,
+        interval_sec: float,
+        symbols: Optional[list],
+        include_closed: bool,
+        closed_limit: int,
+        include_entry: bool,
+        match_window_sec: int,
+    ) -> None:
+        while True:
+            try:
+                await self.reconcile_virtual_orders(
+                    symbols=symbols,
+                    include_closed=include_closed,
+                    closed_limit=closed_limit,
+                    include_entry=include_entry,
+                    match_window_sec=match_window_sec,
+                )
+            except Exception as e:
+                warnings.warn(f"reconcile_virtual_orders loop error: {e}", RuntimeWarning)
+            await asyncio.sleep(interval_sec)
+
+    def start_reconcile_loop(
+        self,
+        interval_sec: float = 5.0,
+        symbols: Optional[list] = None,
+        include_closed: bool = True,
+        closed_limit: int = 100,
+        include_entry: bool = False,
+        match_window_sec: int = 300,
+    ) -> None:
+        """
+        start_reconcile_loop: 启动轻量定时协程自动匹配虚拟单
+        """
+        if self._reconcile_task and not self._reconcile_task.done():
+            return
+        self._reconcile_task = asyncio.create_task(
+            self._reconcile_loop(
+                interval_sec=interval_sec,
+                symbols=symbols,
+                include_closed=include_closed,
+                closed_limit=closed_limit,
+                include_entry=include_entry,
+                match_window_sec=match_window_sec,
+            )
+        )
+
+    async def stop_reconcile_loop(self) -> None:
+        """
+        stop_reconcile_loop: 停止自动匹配协程
+        """
+        if self._reconcile_task and not self._reconcile_task.done():
+            self._reconcile_task.cancel()
+            try:
+                await self._reconcile_task
+            except asyncio.CancelledError:
+                pass
 
     async def _get_http_session(self) -> aiohttp.ClientSession:
         if self._http_session is None or self._http_session.closed:
@@ -415,7 +981,7 @@ class LighterWrapper:
             stop_loss_price: float,
         ) -> tuple:
         """
-        create_market_order_with_tp_sl: 创建市价单并设置止盈止损
+        create_market_order_with_tp_sl: 创建市价单并设置止盈止损（带虚拟订单号）
 
         参数:
             symbol: 交易对符号, 如 "BTC"
@@ -426,8 +992,8 @@ class LighterWrapper:
             custom_order_index: 自定义订单索引, 默认为 0
 
         返回格式示例: 
-            (CreateOrder, RespSendTx, None)     # 成功返回
-            (None, None, error_string)          # 失败返回
+            (virtual_order_id, (CreateOrder, RespSendTx, None))     # 成功返回
+            (virtual_order_id, (None, None, error_string))          # 失败返回
         """
         market_id = await self.get_market_id(symbol)
         symbol_price_decimals = await self.get_symbol_price_decimals(symbol)
@@ -450,13 +1016,19 @@ class LighterWrapper:
         # 创建 IOC 市价单
         resized_amount = await self._resize_amount(symbol, quantity)
 
+        worst_price_int = await self._resize_price(symbol, worst_price)
+        tp_price_int = await self._resize_price(symbol, worst_tp_price)
+        sl_price_int = await self._resize_price(symbol, worst_sl_price)
+        tp_trigger_int = await self._resize_price(symbol, take_profit_price)
+        sl_trigger_int = await self._resize_price(symbol, stop_loss_price)
+
         ioc_order = CreateOrderTxReq(
             MarketIndex=market_id, # 交易对 ID
             # 服务器对 grouped orders 的限制：在 create_grouped_orders 里每个 CreateOrderTxReq.ClientOrderIndex 必须是 nil(0)，不能自定义
             ClientOrderIndex = 0, # 不允许自定义订单索引
             BaseAmount = resized_amount,  # 数量
             # 市价单这里的 Price 仍然要填，用作“最差可接受价格”
-            Price = await self._resize_price(symbol, worst_price),     # 限价
+            Price = worst_price_int,     # 限价
             IsAsk = is_ask_ioc,  # 买卖方向，0 买 1 卖
             Type = self.signer_instance.ORDER_TYPE_MARKET, # 市价单
             TimeInForce = self.signer_instance.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
@@ -470,12 +1042,12 @@ class LighterWrapper:
             MarketIndex=market_id,
             ClientOrderIndex=0,
             BaseAmount=0,
-            Price = await self._resize_price(symbol, worst_tp_price),
+            Price = tp_price_int,
             IsAsk=is_ask_tp_ls, # 和入场单方向相反
             Type=self.signer_instance.ORDER_TYPE_TAKE_PROFIT_LIMIT,
             TimeInForce=self.signer_instance.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
             ReduceOnly=1, # 仅减仓
-            TriggerPrice = await self._resize_price(symbol, take_profit_price),
+            TriggerPrice = tp_trigger_int,
             OrderExpiry=-1,
         )
 
@@ -483,12 +1055,12 @@ class LighterWrapper:
             MarketIndex=market_id,
             ClientOrderIndex=0,
             BaseAmount=0,
-            Price = await self._resize_price(symbol, worst_sl_price),
+            Price = sl_price_int,
             IsAsk=is_ask_tp_ls,
             Type=self.signer_instance.ORDER_TYPE_STOP_LOSS_LIMIT,
             TimeInForce=self.signer_instance.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
             ReduceOnly=1,
-            TriggerPrice = await self._resize_price(symbol, stop_loss_price),
+            TriggerPrice = sl_trigger_int,
             OrderExpiry=-1,
         )
 
@@ -497,7 +1069,41 @@ class LighterWrapper:
             orders=[ioc_order, take_profit_order, stop_loss_order],
         )
 
-        return self._tuple_to_dict(transaction)
+        # 先下单 再记录虚拟订单
+        virtual_order_id = self._generate_virtual_order_id()
+        self._virtual_orders[virtual_order_id] = {
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "take_profit_price": take_profit_price,
+            "stop_loss_price": stop_loss_price,
+            "worst_tp_price": worst_tp_price,
+            "worst_sl_price": worst_sl_price,
+            "tp_price_int": tp_price_int,
+            "sl_price_int": sl_price_int,
+            "tp_trigger_price_int": tp_trigger_int,
+            "sl_trigger_price_int": sl_trigger_int,
+            "order_type": "market_with_tp_sl",
+            "market_id": market_id,
+            "expected_order_count": 2,
+            "status": "created",
+        }
+        self._persist_virtual_order(virtual_order_id)
+
+        res = self._tuple_to_dict(transaction)
+        err = None
+        if isinstance(res, tuple) and len(res) >= 3:
+            err = res[2]
+        if err:
+            self._virtual_orders[virtual_order_id]["status"] = "error"
+            self._virtual_orders[virtual_order_id]["error"] = err
+        else:
+            self._virtual_orders[virtual_order_id]["status"] = "submitted"
+
+        self._virtual_orders[virtual_order_id]["result"] = res
+        self._persist_virtual_order(virtual_order_id)
+
+        return virtual_order_id, res
 
     async def create_market_order(
             self,
@@ -540,7 +1146,84 @@ class LighterWrapper:
         )
 
         return self._tuple_to_dict(res_tuple)
-    
+
+    async def create_limit_order_with_tp_sl_virtual(
+            self,
+            symbol: str,
+            side: str,
+            quantity: float,
+            price: float,
+            take_profit_price: float,
+            stop_loss_price: float,
+            order_expiry: int = -1
+        ) -> tuple:
+        """
+        create_limit_order_with_tp_sl_virtual: 创建限价单并设置止盈止损（带虚拟订单号）
+
+        返回格式示例:
+            (virtual_order_id, (CreateOrder, RespSendTx, None))
+        """
+        # 先下单 再记录虚拟订单
+        res = await self.create_limit_order_with_tp_sl(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            price=price,
+            take_profit_price=take_profit_price,
+            stop_loss_price=stop_loss_price,
+            order_expiry=order_expiry,
+        )
+
+        symbol_price_decimals = await self.get_symbol_price_decimals(symbol)
+
+        if side.lower() == "buy": # 多单
+            worst_tp_price = take_profit_price - (8 * (10 ** -symbol_price_decimals))
+            worst_sl_price = stop_loss_price + (8 * (10 ** -symbol_price_decimals))
+        else:  # 空单
+            worst_tp_price = take_profit_price + (8 * (10 ** -symbol_price_decimals))
+            worst_sl_price = stop_loss_price - (8 * (10 ** -symbol_price_decimals))
+
+        entry_price_int = await self._resize_price(symbol, price)
+        tp_price_int = await self._resize_price(symbol, worst_tp_price)
+        sl_price_int = await self._resize_price(symbol, worst_sl_price)
+        tp_trigger_int = await self._resize_price(symbol, take_profit_price)
+        sl_trigger_int = await self._resize_price(symbol, stop_loss_price)
+
+        virtual_order_id = self._generate_virtual_order_id()
+        self._virtual_orders[virtual_order_id] = {
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "price": price,
+            "take_profit_price": take_profit_price,
+            "stop_loss_price": stop_loss_price,
+            "worst_tp_price": worst_tp_price,
+            "worst_sl_price": worst_sl_price,
+            "entry_price_int": entry_price_int,
+            "tp_price_int": tp_price_int,
+            "sl_price_int": sl_price_int,
+            "tp_trigger_price_int": tp_trigger_int,
+            "sl_trigger_price_int": sl_trigger_int,
+            "order_expiry": order_expiry,
+            "order_type": "limit_with_tp_sl",
+            "expected_order_count": 3,
+            "status": "created",
+        }
+        self._persist_virtual_order(virtual_order_id)
+
+        err = None
+        if isinstance(res, tuple) and len(res) >= 3:
+            err = res[2]
+        if err:
+            self._virtual_orders[virtual_order_id]["status"] = "error"
+            self._virtual_orders[virtual_order_id]["error"] = err
+        else:
+            self._virtual_orders[virtual_order_id]["status"] = "submitted"
+
+        self._virtual_orders[virtual_order_id]["result"] = res
+        self._persist_virtual_order(virtual_order_id)
+        return virtual_order_id, res
+
     async def create_limit_order_with_tp_sl(
             self,
             symbol: str,
@@ -688,15 +1371,17 @@ class LighterWrapper:
         market_id = await self.get_market_id(symbol)
         res_tuple = await self.signer_instance.cancel_order(
             market_index=market_id,
-            client_order_index=order_index,
+            order_index=order_index,
         )
         return self._tuple_to_dict(res_tuple)
     
     async def close_all_positions_for_symbol(self, symbol: str) -> tuple:
         """ 
         close_all_positions_for_symbol: 市价单平仓指定交易对的所有持仓
+
         参数:
             symbol: 交易对符号, 如 "BTC"
+            
         返回格式示例:
             (CreateOrder, RespSendTx, None)     # 成功返回
             (None, None, error_string)          # 失败返回
