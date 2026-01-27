@@ -261,6 +261,33 @@ class LighterWrapper:
         except Exception:
             return bool(reduce_only)
 
+    @staticmethod
+    def _order_matches_identifier(
+        order: dict,
+        order_index: Optional[int],
+        order_id: Optional[int],
+        client_order_index: Optional[int],
+    ) -> bool:
+        def _matches(keys, target):
+            if target is None:
+                return False
+            for key in keys:
+                if key in order and order[key] is not None:
+                    if str(order[key]) == str(target):
+                        return True
+            return False
+
+        if _matches(("order_index", "orderIndex", "order_id", "orderId", "id"), order_index):
+            return True
+        if _matches(("order_id", "orderId", "id", "order_index", "orderIndex"), order_id):
+            return True
+        if _matches(
+            ("client_order_index", "clientOrderIndex", "client_order_id", "clientOrderId"),
+            client_order_index,
+        ):
+            return True
+        return False
+
     def _normalize_order_type(self, order: dict):
         order_type = self._get_order_field(order, "order_type", "orderType", "type", "Type")
         if isinstance(order_type, str):
@@ -886,6 +913,50 @@ class LighterWrapper:
             auth=auth,
         )
         return res.to_dict()
+
+    async def get_order_status(
+        self,
+        symbol: Optional[str] = None,
+        order_index: Optional[int] = None,
+        order_id: Optional[int] = None,
+        client_order_index: Optional[int] = None,
+        virtual_order_id: Optional[str] = None,
+        include_closed: bool = True,
+        closed_limit: int = 100,
+    ) -> dict:
+        """
+        get_order_status: 查询订单状态（支持 virtual_order_id / order_id / order_index / client_order_index）
+        """
+        if virtual_order_id:
+            vo = self._virtual_orders.get(virtual_order_id)
+            if vo is None:
+                return {"status": "not_found", "virtual_order_id": virtual_order_id}
+            return {
+                "status": vo.get("status"),
+                "virtual_order_id": virtual_order_id,
+                "virtual_order": vo,
+            }
+
+        if symbol is None:
+            raise ValueError("symbol is required for order status lookup")
+        if order_index is None and order_id is None and client_order_index is None:
+            raise ValueError("order_index/order_id/client_order_index at least one is required")
+
+        open_res = await self.fetch_open_orders(symbol)
+        open_orders = open_res.get("orders") or []
+        for order in open_orders:
+            if self._order_matches_identifier(order, order_index, order_id, client_order_index):
+                return {"status": "open", "source": "open", "order": order}
+
+        if include_closed:
+            closed_res = await self.fetch_closed_orders(symbol=symbol, limit=closed_limit)
+            closed_orders = closed_res.get("orders") or []
+            for order in closed_orders:
+                if self._order_matches_identifier(order, order_index, order_id, client_order_index):
+                    status = order.get("status") or "closed"
+                    return {"status": status, "source": "closed", "order": order}
+
+        return {"status": "not_found"}
 
     async def cancel_all_orders(self, symbol: str) -> dict:
         """
