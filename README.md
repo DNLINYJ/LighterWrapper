@@ -29,7 +29,7 @@ async def main():
 
     wrapper = LighterWrapper(config)
     try:
-        await wrapper.build_market_id_symbol_map()
+        await wrapper.build_books_metadata_cache()
 
         # 查询账户
         account = await wrapper.get_account()

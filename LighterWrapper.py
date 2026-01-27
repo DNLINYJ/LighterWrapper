@@ -809,7 +809,7 @@ class LighterWrapper:
         get_market_id: 获取指定交易对的 market_id
         """
         # 先查缓存
-        if symbol in list(self.books_metadatas_cache.keys()):
+        if symbol in self.books_metadatas_cache:
             return int(self.books_metadatas_cache[symbol]["market_id"])
         
         # 缓存没有就请求接口
@@ -819,16 +819,16 @@ class LighterWrapper:
                 return int(b.market_id)
         raise ValueError(f"找不到 {symbol} 对应的 market_id")
     
-    async def build_market_id_symbol_map(self) -> dict:
+    async def build_books_metadata_cache(self) -> None:
         """
-        build_market_id_symbol_map: 构建 market_id 和 symbol 的映射字典
+        build_books_metadata_cache: 构建 symbol -> market_id 的映射字典
         """
-        market_map = dict()
         books = await self._order_api.order_books()
-        for b in books.order_books:
-            market_map[int(b.market_id)] = getattr(b, "symbol", None)
-
-        self.books_metadatas_cache = {getattr(b, "symbol", None): b.to_dict() for b in books.order_books}
+        self.books_metadatas_cache = {
+            getattr(b, "symbol", None): b.to_dict()
+            for b in books.order_books
+            if getattr(b, "symbol", None) is not None
+        }
     
     async def get_symbol_price_decimals(self, symbol: str) -> int:
         """

@@ -58,13 +58,12 @@ market_id = await wrapper.get_market_id("BTC")
 
 ---
 
-### `await build_market_id_symbol_map() -> dict`
-**说明**：拉取全量订单簿并更新内部缓存。  
-**注意**：当前实现**不返回**映射（仅更新缓存）。
+### `await build_books_metadata_cache() -> dict`
+**说明**：热构建币种对到 market_id 的缓存.  
 
 **示例**
 ```python
-await wrapper.build_market_id_symbol_map()
+await wrapper.build_books_metadata_cache()
 ```
 
 ---
