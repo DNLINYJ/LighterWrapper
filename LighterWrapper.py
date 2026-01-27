@@ -262,6 +262,66 @@ class LighterWrapper:
             return bool(reduce_only)
 
     @staticmethod
+    def _safe_float(value, default: Optional[float] = None) -> Optional[float]:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    def _derive_fill_status(self, order: dict) -> dict:
+        initial = self._safe_float(
+            self._get_order_field(order, "initial_base_amount", "initialBaseAmount", "base_amount", "baseAmount")
+        )
+        remaining = self._safe_float(
+            self._get_order_field(order, "remaining_base_amount", "remainingBaseAmount")
+        )
+        filled = self._safe_float(
+            self._get_order_field(order, "filled_base_amount", "filledBaseAmount")
+        )
+
+        if filled is None and initial is not None and remaining is not None:
+            filled = max(initial - remaining, 0.0)
+        if remaining is None and initial is not None and filled is not None:
+            remaining = max(initial - filled, 0.0)
+
+        status = order.get("status")
+        status_norm = status.lower() if isinstance(status, str) else None
+
+        fill_status = "unknown"
+        if filled is not None or remaining is not None or initial is not None:
+            if remaining is not None and filled is not None:
+                if remaining <= 0 and filled > 0:
+                    fill_status = "filled"
+                elif filled > 0 and remaining > 0:
+                    fill_status = "partial"
+                elif filled == 0:
+                    fill_status = "unfilled"
+            elif initial is not None and filled is not None:
+                if filled >= initial and initial > 0:
+                    fill_status = "filled"
+                elif filled > 0:
+                    fill_status = "partial"
+                else:
+                    fill_status = "unfilled"
+
+        if status_norm in ("canceled", "cancelled", "canceled-reduce-only", "expired", "rejected"):
+            if fill_status == "unfilled":
+                fill_status = "canceled"
+
+        filled_ratio = None
+        if initial and initial > 0 and filled is not None:
+            filled_ratio = min(max(filled / initial, 0.0), 1.0)
+
+        return {
+            "order_status": status,
+            "fill_status": fill_status,
+            "initial_base_amount": initial,
+            "filled_base_amount": filled,
+            "remaining_base_amount": remaining,
+            "filled_ratio": filled_ratio,
+        }
+
+    @staticmethod
     def _order_matches_identifier(
         order: dict,
         order_index: Optional[int],
@@ -914,6 +974,78 @@ class LighterWrapper:
         )
         return res.to_dict()
 
+    async def fetch_fills(
+        self,
+        symbol: Optional[str] = None,
+        market_id: Optional[int] = None,
+        order_index: Optional[int] = None,
+        limit: int = 100,
+        sort_by: str = "timestamp",
+        cursor: Optional[str] = None,
+        ask_filter: Optional[int] = None,
+        role: str = "all",
+        trade_type: str = "all",
+        aggregate: bool = False,
+        auth: Optional[str] = None,
+    ) -> dict:
+        """
+        fetch_fills: 获取成交记录（fills）
+
+        参数:
+            symbol: 交易对符号, 如 "BTC"（可选）
+            market_id: 交易对 ID（可选，symbol 存在时自动换算）
+            order_index: 订单索引（可选）
+            limit: 返回数量（1-100）
+            sort_by: block_height / timestamp / trade_id
+            cursor: 翻页游标（可选）
+            ask_filter: 0 买单 / 1 卖单（可选）
+            role: all / maker / taker
+            trade_type: all / trade / liquidation / deleverage / market-settlement
+            aggregate: 是否聚合
+            auth: 可选认证 token，不传则自动生成
+        """
+        if market_id is None and symbol:
+            market_id = await self.get_market_id(symbol)
+        if auth is None:
+            auth = self._get_auth_token()
+
+        res = await self._order_api.trades(
+            sort_by=sort_by,
+            limit=limit,
+            auth=auth,
+            market_id=market_id,
+            account_index=self.config.account_index,
+            order_index=order_index,
+            sort_dir="desc",
+            cursor=cursor,
+            ask_filter=ask_filter,
+            role=role,
+            type=trade_type,
+            aggregate=aggregate,
+        )
+        return res.to_dict()
+
+    async def get_order_fills(
+        self,
+        symbol: Optional[str] = None,
+        order_index: Optional[int] = None,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+        auth: Optional[str] = None,
+    ) -> dict:
+        """
+        get_order_fills: 获取指定订单的成交记录
+        """
+        if order_index is None:
+            raise ValueError("order_index is required for order fills lookup")
+        return await self.fetch_fills(
+            symbol=symbol,
+            order_index=order_index,
+            limit=limit,
+            cursor=cursor,
+            auth=auth,
+        )
+
     async def get_order_status(
         self,
         symbol: Optional[str] = None,
@@ -923,6 +1055,8 @@ class LighterWrapper:
         virtual_order_id: Optional[str] = None,
         include_closed: bool = True,
         closed_limit: int = 100,
+        include_fills: bool = False,
+        fills_limit: int = 100,
     ) -> dict:
         """
         get_order_status: 查询订单状态（支持 virtual_order_id / order_id / order_index / client_order_index）
@@ -946,7 +1080,18 @@ class LighterWrapper:
         open_orders = open_res.get("orders") or []
         for order in open_orders:
             if self._order_matches_identifier(order, order_index, order_id, client_order_index):
-                return {"status": "open", "source": "open", "order": order}
+                status_info = self._derive_fill_status(order)
+                result = {"status": "open", "source": "open", "order": order, **status_info}
+                if include_fills:
+                    oi = order_index or self._get_order_field(order, "order_index", "orderIndex")
+                    if oi is not None:
+                        fills = await self.get_order_fills(
+                            symbol=symbol,
+                            order_index=int(oi),
+                            limit=fills_limit,
+                        )
+                        result["fills"] = fills
+                return result
 
         if include_closed:
             closed_res = await self.fetch_closed_orders(symbol=symbol, limit=closed_limit)
@@ -954,7 +1099,18 @@ class LighterWrapper:
             for order in closed_orders:
                 if self._order_matches_identifier(order, order_index, order_id, client_order_index):
                     status = order.get("status") or "closed"
-                    return {"status": status, "source": "closed", "order": order}
+                    status_info = self._derive_fill_status(order)
+                    result = {"status": status, "source": "closed", "order": order, **status_info}
+                    if include_fills:
+                        oi = order_index or self._get_order_field(order, "order_index", "orderIndex")
+                        if oi is not None:
+                            fills = await self.get_order_fills(
+                                symbol=symbol,
+                                order_index=int(oi),
+                                limit=fills_limit,
+                            )
+                            result["fills"] = fills
+                    return result
 
         return {"status": "not_found"}
 
