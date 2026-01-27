@@ -1368,7 +1368,7 @@ class LighterWrapper:
             client_order_index=custom_order_index if custom_order_index else 0,
             base_amount=await self._resize_amount(symbol, quantity),
             is_ask=is_ask,
-            avg_execution_price=await self._resize_amount(symbol, worst_price),
+            avg_execution_price=await self._resize_price(symbol, worst_price),
             reduce_only=reduce_only,
         )
 
