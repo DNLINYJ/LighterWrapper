@@ -16,7 +16,7 @@ async def main():
 
     wrapper = LighterWrapper(config)
     try:
-        await wrapper.bulid_market_id_symbol_map()
+        await wrapper.build_market_id_symbol_map()
         account = await wrapper.get_account()
         positions = await wrapper.get_positions_by_symbol("BTC")
         ohlcv = await wrapper.fetch_ohlcv("BTC", resolution="1m", limit=10)

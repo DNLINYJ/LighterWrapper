@@ -819,9 +819,9 @@ class LighterWrapper:
                 return int(b.market_id)
         raise ValueError(f"找不到 {symbol} 对应的 market_id")
     
-    async def bulid_market_id_symbol_map(self) -> dict:
+    async def build_market_id_symbol_map(self) -> dict:
         """
-        bulid_market_id_symbol_map: 构建 market_id 和 symbol 的映射字典
+        build_market_id_symbol_map: 构建 market_id 和 symbol 的映射字典
         """
         market_map = dict()
         books = await self._order_api.order_books()

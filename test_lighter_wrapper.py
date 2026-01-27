@@ -80,7 +80,7 @@ async def main() -> None:
     wrapper = LighterWrapper(config)
     try:
         _section("基础初始化")
-        await wrapper.bulid_market_id_symbol_map()
+        await wrapper.build_market_id_symbol_map()
 
         # 基础查询与元数据
         _section("市场元数据/行情")
