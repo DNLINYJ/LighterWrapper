@@ -19,7 +19,7 @@ from typing import Dict, Optional
 @dataclass
 class APIConfig:
     base_url: str
-    api_secret_key: Dict[int, str]  # {account_index: api_secret_key}
+    api_secret_key: Dict[int, str]  # {api_secret_key_index: api_secret_key}
     account_index: int
 
 class LighterWrapper:
