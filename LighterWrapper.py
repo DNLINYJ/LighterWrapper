@@ -1579,6 +1579,7 @@ class LighterWrapper:
             take_profit_price: float,
             stop_loss_price: float,
             tp_sl_market: bool = True,
+            max_slippage: float = 0.005,
         ) -> tuple:
         """
         create_market_order_with_tp_sl: 创建市价单并设置止盈止损（带虚拟订单号）
@@ -1589,33 +1590,32 @@ class LighterWrapper:
             quantity: 交易数量 (交易币种) 如 0.1 ETH
             take_profit_price: 止盈价格
             stop_loss_price: 止损价格
-            custom_order_index: 自定义订单索引, 默认为 0
+            tp_sl_market: 是否使用市价 TP/SL
+            max_slippage: TP/SL 最差价格偏移比例
 
         返回格式示例: 
             (virtual_order_id, (CreateOrder, RespSendTx, None))     # 成功返回
             (virtual_order_id, (None, None, error_string))          # 失败返回
         """
         market_id = await self.get_market_id(symbol)
-        symbol_price_decimals = await self.get_symbol_price_decimals(symbol)
 
         if side.lower() == "buy": # 多单
             is_ask_ioc = 0
             is_ask_tp_ls = 1
             worst_price = await self.calulate_worst_acceptable_price(symbol, side="buy")
-            worst_tp_price = take_profit_price - (8 * (10 ** -symbol_price_decimals)) # 止盈价格略低于目标价
-            worst_sl_price = stop_loss_price + (8 * (10 ** -symbol_price_decimals)) # 止损价格略高于目标价
+            worst_tp_price = take_profit_price * (1 - max_slippage)  # 止盈价格略低于目标价
+            worst_sl_price = stop_loss_price * (1 + max_slippage)  # 止损价格略高于目标价
         else:  # 空单
             is_ask_ioc = 1
             is_ask_tp_ls = 0
             worst_price = await self.calulate_worst_acceptable_price(symbol, side="sell")
-            worst_tp_price = take_profit_price + (8 * (10 ** -symbol_price_decimals)) # 止盈价格略高于目标价
-            worst_sl_price = stop_loss_price - (8 * (10 ** -symbol_price_decimals)) # 止损价格略低于目标价
+            worst_tp_price = take_profit_price * (1 + max_slippage)  # 止盈价格略高于目标价
+            worst_sl_price = stop_loss_price * (1 - max_slippage)  # 止损价格略低于目标价
 
         # https://deepwiki.com/elliottech/lighter-python/6.3-grouped-and-conditional-orders
         # 设置 BaseAmount = 0 此订单会创建一个与持仓规模关联的订单
         # 创建 IOC 市价单
         resized_amount = await self._resize_amount(symbol, quantity)
-
         worst_price_int = await self._resize_price(symbol, worst_price)
         tp_price_int = await self._resize_price(symbol, worst_tp_price)
         sl_price_int = await self._resize_price(symbol, worst_sl_price)
