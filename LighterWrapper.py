@@ -1516,13 +1516,14 @@ class LighterWrapper:
 
         return self._tuple_to_dict(res_tuple)
 
-    async def calulate_worst_acceptable_price(self, symbol: str, side: str, max_slippage: float = 0.005) -> float:
+    async def calulate_worst_acceptable_price(self, symbol: str, side: str, max_slippage: float = 0.001) -> float:
         """
         calulate_worst_acceptable_price: 计算市价单的最差可接受价格
         
         参数:
             symbol: 交易对符号, 如 "BTC"
             side: "buy" 或 "sell"
+            max_slippage: 最大滑点比例 (默认 0.001 即 0.1%)
 
         返回格式示例: 2500.0
         """
@@ -1579,7 +1580,7 @@ class LighterWrapper:
             take_profit_price: float,
             stop_loss_price: float,
             tp_sl_market: bool = True,
-            max_slippage: float = 0.005,
+            max_slippage: float = 0.001,
         ) -> tuple:
         """
         create_market_order_with_tp_sl: 创建市价单并设置止盈止损（带虚拟订单号）
@@ -1591,7 +1592,7 @@ class LighterWrapper:
             take_profit_price: 止盈价格
             stop_loss_price: 止损价格
             tp_sl_market: 是否使用市价 TP/SL
-            max_slippage: TP/SL 最差价格偏移比例 (默认 0.005 即 0.5%)
+            max_slippage: TP/SL 最差价格偏移比例 (默认 0.001 即 0.1%)
 
         返回格式示例: 
             (virtual_order_id, (CreateOrder, RespSendTx, None))     # 成功返回
@@ -1602,13 +1603,13 @@ class LighterWrapper:
         if side.lower() == "buy": # 多单
             is_ask_ioc = 0
             is_ask_tp_ls = 1
-            worst_price = await self.calulate_worst_acceptable_price(symbol, side="buy")
+            worst_price = await self.calulate_worst_acceptable_price(symbol, side="buy", max_slippage=max_slippage)
             worst_tp_price = take_profit_price * (1 - max_slippage)  # 止盈价格略低于目标价
             worst_sl_price = stop_loss_price * (1 - max_slippage) 
         else:  # 空单
             is_ask_ioc = 1
             is_ask_tp_ls = 0
-            worst_price = await self.calulate_worst_acceptable_price(symbol, side="sell")
+            worst_price = await self.calulate_worst_acceptable_price(symbol, side="sell", max_slippage=max_slippage)
             worst_tp_price = take_profit_price * (1 + max_slippage)  # 止盈价格略高于目标价
             worst_sl_price = stop_loss_price * (1 + max_slippage)
 
