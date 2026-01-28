@@ -886,6 +886,65 @@ class LighterWrapper:
         path = f"/api/v1/candles?market_id={market_id}&resolution={resolution}&start_timestamp={start_timestamp}&end_timestamp={end_timestamp}&count_back={count_back}"
         return await self._http_get_json(path)
 
+    async def fetch_ticker(self, symbol: str, include_raw: bool = False) -> dict:
+        """
+        fetch_ticker: 获取 ticker（含最新价与 24h 统计）
+
+        参数:
+            symbol: 交易对符号, 如 "BTC"
+            include_raw: 是否返回完整原始结构
+        返回格式示例:
+            {"code": 200, "ticker": {...}} 或包含 raw
+        """
+        market_id = await self.get_market_id(symbol)
+        res = await self._order_api.order_book_details(market_id=market_id)
+        data = res.to_dict()
+
+        details = data.get("order_book_details") or data.get("spot_order_book_details") or []
+        ticker = None
+        for item in details:
+            if item.get("market_id") == market_id or item.get("symbol") == symbol:
+                ticker = item
+                break
+        if ticker is None and details:
+            ticker = details[0]
+
+        out = {"code": data.get("code", 200), "ticker": ticker}
+        if include_raw:
+            out["raw"] = data
+        return out
+
+    async def get_latest_price(self, symbol: str) -> Optional[float]:
+        """
+        get_latest_price: 获取最新成交价（优先 recent_trades, 无数据则用 ticker 的 last_trade_price）
+        """
+        market_id = await self.get_market_id(symbol)
+        res = await self._order_api.recent_trades(market_id=market_id, limit=1)
+        data = res.to_dict()
+        trades = data.get("trades") or []
+        if trades:
+            price = trades[0].get("price")
+            return self._safe_float(price)
+
+        ticker = await self.fetch_ticker(symbol)
+        if ticker.get("ticker"):
+            return self._safe_float(ticker["ticker"].get("last_trade_price"))
+        return None
+
+    async def fetch_order_book_depth(self, symbol: str, limit: int = 50) -> dict:
+        """
+        fetch_order_book_depth: 获取盘口深度（bids/asks）
+
+        参数:
+            symbol: 交易对符号, 如 "BTC"
+            limit: 深度档数（1-250）
+        返回格式示例:
+            {"code": 200, "asks": [...], "bids": [...], "total_asks": 10, "total_bids": 10}
+        """
+        market_id = await self.get_market_id(symbol)
+        res = await self._order_api.order_book_orders(market_id=market_id, limit=limit)
+        return res.to_dict()
+
     async def get_order_books_metadata(self, symbol: str) -> dict:
         """
         get_order_books_metadata: 获取指定交易对的订单簿元数据
@@ -1179,7 +1238,7 @@ class LighterWrapper:
 
         return self._tuple_to_dict(res_tuple)
 
-    async def calulate_worst_acceptable_price(self, symbol: str, side: str) -> float:
+    async def calulate_worst_acceptable_price(self, symbol: str, side: str, max_slippage: float = 0.005) -> float:
         """
         calulate_worst_acceptable_price: 计算市价单的最差可接受价格
         
@@ -1193,9 +1252,12 @@ class LighterWrapper:
         last_price = await self.fetch_ohlcv(symbol=symbol, resolution="1m", limit=1)
         last_close = last_price['c'][-1]['c']
         if side.lower() == "buy":
-            worst_price = last_close + (8 * (10 ** -symbol_price_decimals)) # 买单取略高于收盘价的价格
+            worst_price = last_close * (1 + max_slippage) # 买单取略高于收盘价的价格
         else:
-            worst_price = last_close - (8 * (10 ** -symbol_price_decimals)) # 卖单取略低于收盘价的价格
+            worst_price = last_close * (1 - max_slippage) # 卖单取略低于收盘价的价格
+
+        # 价格四舍五入到指定精度
+        worst_price = round(worst_price, symbol_price_decimals)
 
         return worst_price
 

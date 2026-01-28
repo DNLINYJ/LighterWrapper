@@ -89,6 +89,9 @@ async def main() -> None:
         price_decimals = await wrapper.get_symbol_price_decimals(symbol)
         size_decimals = await wrapper.get_symbol_size_decimals(symbol)
         ohlcv = await wrapper.fetch_ohlcv(symbol=symbol, resolution="1m", limit=1)
+        ticker = await wrapper.fetch_ticker(symbol)
+        latest_price = await wrapper.get_latest_price(symbol)
+        depth = await wrapper.fetch_order_book_depth(symbol, limit=20)
         last_close = ohlcv["c"][-1]["c"]
 
         print("market_id:", market_id)
@@ -96,6 +99,9 @@ async def main() -> None:
         print("price_decimals:", price_decimals)
         print("size_decimals:", size_decimals)
         _print_json("ohlcv(last)", ohlcv)
+        _print_json("ticker", ticker)
+        print("latest_price:", latest_price)
+        _print_json("order_book_depth", depth)
 
         # 账户与订单
         _section("账户/持仓/订单")

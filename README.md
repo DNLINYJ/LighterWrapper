@@ -6,6 +6,7 @@ Lighter DEX Python SDK 的轻量封装，面向量化交易与后台展示场景
 - 虚拟订单号（适配组合单无真实 order_id 的情况）
 - 自动匹配虚拟单 ↔ 实际订单（可定时 loop）
 - 成交记录（fills）与订单状态跟踪（部分成交/完成）
+- ticker / 最新价 / 盘口深度
 - 轻量 SQLite 持久化（按 account_index 命名）
 - 全异步调用（aiohttp + SDK async）
 

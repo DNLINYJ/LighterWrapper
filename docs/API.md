@@ -130,6 +130,35 @@ await wrapper.build_books_metadata_cache()
 
 ---
 
+### `await fetch_ticker(symbol: str, include_raw: bool = False) -> dict`
+**参数**
+- `symbol: str`
+- `include_raw: bool`：是否包含完整原始结构
+
+**返回**
+```json
+{"code": 200, "ticker": {"last_trade_price": 88000.0, "daily_price_high": 90000.0}}
+```
+
+---
+
+### `await get_latest_price(symbol: str) -> Optional[float]`
+**说明**：优先从 recent_trades 获取最新成交价，无数据则回退到 ticker 的 `last_trade_price`。
+
+---
+
+### `await fetch_order_book_depth(symbol: str, limit=50) -> dict`
+**参数**
+- `symbol: str`
+- `limit: int`：1~250
+
+**返回**
+```json
+{"code": 200, "asks": [...], "bids": [...], "total_asks": 10, "total_bids": 10}
+```
+
+---
+
 ## 账户 / 持仓
 
 ### `await get_account() -> dict`

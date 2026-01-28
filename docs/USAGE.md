@@ -20,7 +20,11 @@ async def main():
         account = await wrapper.get_account()
         positions = await wrapper.get_positions_by_symbol("BTC")
         ohlcv = await wrapper.fetch_ohlcv("BTC", resolution="1m", limit=10)
+        ticker = await wrapper.fetch_ticker("BTC")
+        last_price = await wrapper.get_latest_price("BTC")
+        depth = await wrapper.fetch_order_book_depth("BTC", limit=20)
         print(account, positions, ohlcv)
+        print(ticker, last_price, depth)
     finally:
         await wrapper._close()
 
