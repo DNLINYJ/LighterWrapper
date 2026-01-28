@@ -1073,6 +1073,8 @@ class LighterWrapper:
         books = await self._order_api.order_books()
         for b in books.order_books:
             if getattr(b, "symbol", None) == symbol:
+                # 更新缓存
+                self.books_metadatas_cache[symbol] = b.to_dict()
                 return int(b.market_id)
         raise ValueError(f"找不到 {symbol} 对应的 market_id")
     
