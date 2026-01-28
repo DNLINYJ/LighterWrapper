@@ -53,6 +53,7 @@ class LighterWrapper:
         self._price_cache_max_age_sec = 10
         self._price_cache_fresh_slippage_ticks = 8
         self._price_cache_stale_slippage_ticks = 20
+        self._warn_on_precision = False
 
         self.books_metadatas_cache = dict()  # 订单簿元数据缓存 用于加速获取 market_id 和 换算精度
                                              # {"symbol": {...}, ...}
@@ -82,11 +83,12 @@ class LighterWrapper:
         rounded = round(scaled)
         # 最小精度检测：如果不是可用精度的整数倍，给出 Warning 并抛弃小数点
         if not math.isclose(scaled, rounded, rel_tol=0.0, abs_tol=1e-6):
-            min_step = 10 ** (-size_decimals)
-            warnings.warn(
-                f"amount 精度超限，最小步进 {min_step}，传入 {amount}；已截断至最小精度",
-                RuntimeWarning,
-            )
+            if self._warn_on_precision:
+                min_step = 10 ** (-size_decimals)
+                warnings.warn(
+                    f"amount 精度超限，最小步进 {min_step}，传入 {amount}；已截断至最小精度",
+                    RuntimeWarning,
+                )
             return int(scaled)
         return int(rounded) # 根据精度缩放数量
 
@@ -102,11 +104,12 @@ class LighterWrapper:
         rounded = round(scaled)
         # 最小精度检测：如果不是可用精度的整数倍，给出 Warning 并抛弃小数点
         if not math.isclose(scaled, rounded, rel_tol=0.0, abs_tol=1e-6):
-            min_step = 10 ** (-price_decimals)
-            warnings.warn(
-                f"price 精度超限，最小步进 {min_step}，传入 {price}；已截断至最小精度",
-                RuntimeWarning,
-            )
+            if self._warn_on_precision:
+                min_step = 10 ** (-price_decimals)
+                warnings.warn(
+                    f"price 精度超限，最小步进 {min_step}，传入 {price}；已截断至最小精度",
+                    RuntimeWarning,
+                )
             return int(scaled)
         return int(rounded) # 根据精度缩放价格
 
