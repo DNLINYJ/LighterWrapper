@@ -1490,13 +1490,13 @@ class LighterWrapper:
             "results": results,
         }
 
-    async def update_symbol_leverage(self, symbol: str, leverage: float, margin_mode: str) -> tuple:
+    async def update_symbol_leverage(self, symbol: str, leverage: int, margin_mode: str) -> tuple:
         """
         update_symbol_leverage: 更新指定交易对的杠杆倍数
 
         参数:
             symbol: 交易对符号, 如 "BTC"
-            leverage: 杠杆倍数, 如 3.0
+            leverage: 杠杆倍数
             margin_mode: 杠杆模式, "isolated" 或 "cross"
 
         返回格式示例: Tuple[str, RespSendTx, Optional[str]] - (tx_info, response, error)
