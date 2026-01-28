@@ -59,6 +59,15 @@ def _json_default(obj):
 def _print_json(label: str, data) -> None:
     print(f"{label}: {json.dumps(data, ensure_ascii=False, indent=2, default=_json_default)}")
 
+async def _timed(label: str, coro):
+    start = time.perf_counter()
+    try:
+        result = await coro
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        print(f"{label} latency_ms: {elapsed_ms:.2f}")
+    return result
+
 
 async def main() -> None:
     config = _load_config_from_env()
@@ -69,6 +78,7 @@ async def main() -> None:
     run_market = os.getenv("RUN_MARKET_TESTS", "0") == "1"
     run_close_positions = os.getenv("RUN_CLOSE_POSITIONS", "0") == "1"
     run_reconcile_loop = os.getenv("RUN_RECONCILE_LOOP", "0") == "1"
+    run_market_cache_loop = os.getenv("RUN_MARKET_CACHE_LOOP", "0") == "1"
 
     symbol = os.getenv("LIGHTER_TEST_SYMBOL", "BTC")
     test_qty = float(os.getenv("LIGHTER_TEST_QTY", "0.001"))
@@ -76,6 +86,7 @@ async def main() -> None:
     tp_multiplier = float(os.getenv("LIGHTER_TP_MULTIPLIER", "1.05"))
     sl_multiplier = float(os.getenv("LIGHTER_SL_MULTIPLIER", "0.95"))
     reconcile_interval = float(os.getenv("RECONCILE_LOOP_INTERVAL", "5"))
+    market_cache_interval = float(os.getenv("MARKET_CACHE_LOOP_INTERVAL", "2"))
 
     wrapper = LighterWrapper(config)
     try:
@@ -137,6 +148,15 @@ async def main() -> None:
                 include_closed=True,
                 closed_limit=100,
             )
+        if run_market_cache_loop:
+            _section("行情缓存 Loop")
+            wrapper.start_market_cache_loop(
+                symbols=[symbol],
+                interval_sec=market_cache_interval,
+                use_ticker=True,
+                use_order_book=True,
+                depth_limit=1,
+            )
 
         if not run_trading:
             print("RUN_TRADING_TESTS=1 未开启，仅执行查询类测试。")
@@ -146,13 +166,16 @@ async def main() -> None:
         _section("限价单下单 + 撤单")
         limit_price = last_close * limit_multiplier
         custom_order_index = int(time.time() * 1000) % (2**31)
-        limit_res = await wrapper.create_limit_order(
-            symbol=symbol,
-            side="buy",
-            quantity=test_qty,
-            price=limit_price,
-            reduce_only=False,
-            custom_order_index=custom_order_index,
+        limit_res = await _timed(
+            "create_limit_order",
+            wrapper.create_limit_order(
+                symbol=symbol,
+                side="buy",
+                quantity=test_qty,
+                price=limit_price,
+                reduce_only=False,
+                custom_order_index=custom_order_index,
+            ),
         )
         _print_json("create_limit_order", limit_res)
         status_res = await wrapper.get_order_status(
@@ -170,13 +193,16 @@ async def main() -> None:
         take_profit_price = last_close * tp_multiplier
         stop_loss_price = last_close * sl_multiplier
 
-        virtual_id, grouped_res = await wrapper.create_limit_order_with_tp_sl_virtual(
-            symbol=symbol,
-            side="buy",
-            quantity=test_qty,
-            price=limit_price,
-            take_profit_price=take_profit_price,
-            stop_loss_price=stop_loss_price,
+        virtual_id, grouped_res = await _timed(
+            "create_limit_order_with_tp_sl_virtual",
+            wrapper.create_limit_order_with_tp_sl_virtual(
+                symbol=symbol,
+                side="buy",
+                quantity=test_qty,
+                price=limit_price,
+                take_profit_price=take_profit_price,
+                stop_loss_price=stop_loss_price,
+            ),
         )
         print("virtual_id:", virtual_id)
         _print_json("create_limit_order_with_tp_sl_virtual", grouped_res)
@@ -199,12 +225,15 @@ async def main() -> None:
         # 4) 市价单 + TP/SL（风险较高，需手动开启）
         if run_market:
             _section("市价单 TP/SL")
-            market_virtual_id, market_res = await wrapper.create_market_order_with_tp_sl(
-                symbol=symbol,
-                side="buy",
-                quantity=test_qty,
-                take_profit_price=take_profit_price,
-                stop_loss_price=stop_loss_price,
+            market_virtual_id, market_res = await _timed(
+                "create_market_order_with_tp_sl",
+                wrapper.create_market_order_with_tp_sl(
+                    symbol=symbol,
+                    side="buy",
+                    quantity=test_qty,
+                    take_profit_price=take_profit_price,
+                    stop_loss_price=stop_loss_price,
+                ),
             )
             print("market_virtual_id:", market_virtual_id)
             _print_json("create_market_order_with_tp_sl", market_res)
@@ -220,6 +249,8 @@ async def main() -> None:
             close_res = await wrapper.close_all_positions_for_symbol(symbol)
             _print_json("close_all_positions_for_symbol", close_res)
     finally:
+        if run_market_cache_loop:
+            await wrapper.stop_market_cache_loop()
         if run_reconcile_loop:
             await wrapper.stop_reconcile_loop()
         await wrapper._close()

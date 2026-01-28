@@ -93,3 +93,16 @@ wrapper.start_reconcile_loop(interval_sec=5, symbols=["BTC"])
 # ...
 await wrapper.stop_reconcile_loop()
 ```
+
+## 7. 行情缓存轮询（热路径下单推荐）
+```python
+wrapper.start_market_cache_loop(
+    symbols=["BTC"],
+    interval_sec=2.0,
+    use_ticker=True,
+    use_order_book=True,
+    depth_limit=1,
+)
+# ...
+await wrapper.stop_market_cache_loop()
+```

@@ -39,10 +39,20 @@ class LighterWrapper:
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._http_timeout = aiohttp.ClientTimeout(total=10)
         self._virtual_orders: Dict[str, dict] = {}
+        self._db_queue: asyncio.Queue = asyncio.Queue()
+        self._db_writer_task: Optional[asyncio.Task] = None
+        self._db_flush_batch_size = 50
+        self._db_flush_interval_sec = 0.2
+        self._db_writer_stop_timeout = 5.0
         self._db_path = f"{self.config.account_index}.db"
         self._init_virtual_orders_db()
         self._load_virtual_orders()
         self._reconcile_task: Optional[asyncio.Task] = None
+        self._market_cache_task: Optional[asyncio.Task] = None
+        self._price_cache: Dict[str, dict] = {}
+        self._price_cache_max_age_sec = 10
+        self._price_cache_fresh_slippage_ticks = 8
+        self._price_cache_stale_slippage_ticks = 20
 
         self.books_metadatas_cache = dict()  # 订单簿元数据缓存 用于加速获取 market_id 和 换算精度
                                              # {"symbol": {...}, ...}
@@ -101,16 +111,33 @@ class LighterWrapper:
         return int(rounded) # 根据精度缩放价格
 
     async def _close(self):
-        if self._reconcile_task and not self._reconcile_task.done():
-            self._reconcile_task.cancel()
+        await self._cancel_task(self._reconcile_task, "reconcile_loop")
+        await self._cancel_task(self._market_cache_task, "market_cache_loop")
+        await self._stop_db_writer(fast_exit=True)
+        await self._await_with_timeout(self.api_client.close(), "api_client.close")
+        await self._await_with_timeout(self.signer_instance.close(), "signer_instance.close")
+        if self._http_session and not self._http_session.closed:
+            await self._await_with_timeout(self._http_session.close(), "http_session.close")
+
+    async def _cancel_task(self, task: Optional[asyncio.Task], name: str, timeout_sec: float = 2.0) -> None:
+        if task and not task.done():
+            task.cancel()
             try:
-                await self._reconcile_task
+                await asyncio.wait_for(task, timeout=timeout_sec)
             except asyncio.CancelledError:
                 pass
-        await self.api_client.close()
-        await self.signer_instance.close()
-        if self._http_session and not self._http_session.closed:
-            await self._http_session.close()
+            except asyncio.TimeoutError:
+                warnings.warn(f"{name} cancel timeout", RuntimeWarning)
+            except Exception as e:
+                warnings.warn(f"{name} cancel error: {e}", RuntimeWarning)
+
+    async def _await_with_timeout(self, awaitable, name: str, timeout_sec: float = 2.0) -> None:
+        try:
+            await asyncio.wait_for(awaitable, timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            warnings.warn(f"{name} timeout", RuntimeWarning)
+        except Exception as e:
+            warnings.warn(f"{name} error: {e}", RuntimeWarning)
 
     def _get_auth_token(self) -> Optional[str]:
         """
@@ -128,6 +155,7 @@ class LighterWrapper:
     def _init_virtual_orders_db(self) -> None:
         conn = sqlite3.connect(self._db_path)
         try:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS virtual_orders (
@@ -149,6 +177,7 @@ class LighterWrapper:
     def _load_virtual_orders(self) -> None:
         conn = sqlite3.connect(self._db_path)
         try:
+            conn.execute("PRAGMA journal_mode=WAL")
             cursor = conn.execute(
                 "SELECT virtual_order_id, data_json FROM virtual_orders"
             )
@@ -176,7 +205,121 @@ class LighterWrapper:
             return list(obj)
         return str(obj)
 
-    def _persist_virtual_order(self, virtual_order_id: str) -> None:
+    def _flush_virtual_orders(self, conn: sqlite3.Connection, items: list) -> None:
+        rows = []
+        for item in items:
+            virtual_order_id = item["virtual_order_id"]
+            data = item["data"]
+            status = data.get("status")
+            created_at_ms = data.get("created_at_ms")
+            updated_at_ms = data.get("updated_at_ms")
+            data_json = json.dumps(data, ensure_ascii=False, default=self._json_default)
+            rows.append(
+                (
+                    virtual_order_id,
+                    self.config.account_index,
+                    status,
+                    created_at_ms,
+                    updated_at_ms,
+                    data_json,
+                )
+            )
+        conn.executemany(
+            """
+            INSERT INTO virtual_orders (
+                virtual_order_id,
+                account_index,
+                status,
+                created_at_ms,
+                updated_at_ms,
+                data_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(virtual_order_id) DO UPDATE SET
+                status=excluded.status,
+                updated_at_ms=excluded.updated_at_ms,
+                data_json=excluded.data_json
+            """,
+            rows,
+        )
+        conn.commit()
+
+    async def _db_writer_loop(self) -> None:
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        pending = []
+        last_flush = time.monotonic()
+        drop_all = False
+        try:
+            while True:
+                timeout = max(
+                    0.0, self._db_flush_interval_sec - (time.monotonic() - last_flush)
+                )
+                try:
+                    item = await asyncio.wait_for(self._db_queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    item = None
+
+                if item:
+                    if item.get("__stop__"):
+                        drop_all = bool(item.get("drop_pending"))
+                        while True:
+                            try:
+                                extra = self._db_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                            if extra.get("__stop__"):
+                                if extra.get("drop_pending"):
+                                    drop_all = True
+                                continue
+                            if not drop_all:
+                                pending.append(extra)
+                        if pending and not drop_all:
+                            await asyncio.to_thread(self._flush_virtual_orders, conn, pending)
+                            pending.clear()
+                        break
+                    pending.append(item)
+
+                if pending and (len(pending) >= self._db_flush_batch_size or item is None) and not drop_all:
+                    await asyncio.to_thread(self._flush_virtual_orders, conn, pending)
+                    pending.clear()
+                    last_flush = time.monotonic()
+        finally:
+            if pending and not drop_all:
+                await asyncio.to_thread(self._flush_virtual_orders, conn, pending)
+            conn.close()
+
+    def _ensure_db_writer(self) -> bool:
+        if self._db_writer_task is None or self._db_writer_task.done():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return False
+            self._db_writer_task = loop.create_task(self._db_writer_loop())
+        return True
+
+    async def _stop_db_writer(
+        self,
+        timeout_sec: Optional[float] = None,
+        warn_on_timeout: bool = False,
+        fast_exit: bool = False,
+    ) -> None:
+        if timeout_sec is None:
+            timeout_sec = self._db_writer_stop_timeout
+        if self._db_writer_task and not self._db_writer_task.done():
+            await self._db_queue.put({"__stop__": True, "drop_pending": fast_exit})
+            try:
+                wait_timeout = 0.2 if fast_exit else timeout_sec
+                await asyncio.wait_for(self._db_writer_task, timeout=wait_timeout)
+            except asyncio.TimeoutError:
+                self._db_writer_task.cancel()
+                if warn_on_timeout and not fast_exit:
+                    warnings.warn("db_writer stop timeout", RuntimeWarning)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                warnings.warn(f"db_writer stop error: {e}", RuntimeWarning)
+
+    def _persist_virtual_order_sync(self, virtual_order_id: str) -> None:
         data = self._virtual_orders.get(virtual_order_id)
         if data is None:
             return
@@ -189,6 +332,7 @@ class LighterWrapper:
 
         conn = sqlite3.connect(self._db_path)
         try:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 INSERT INTO virtual_orders (
@@ -216,6 +360,24 @@ class LighterWrapper:
             conn.commit()
         finally:
             conn.close()
+
+    def _persist_virtual_order(self, virtual_order_id: str) -> None:
+        data = self._virtual_orders.get(virtual_order_id)
+        if data is None:
+            return
+        now_ms = int(time.time() * 1000)
+        if data.get("created_at_ms") is None:
+            data["created_at_ms"] = now_ms
+        data["updated_at_ms"] = now_ms
+
+        if not self._ensure_db_writer():
+            self._persist_virtual_order_sync(virtual_order_id)
+            return
+
+        try:
+            self._db_queue.put_nowait({"virtual_order_id": virtual_order_id, "data": dict(data)})
+        except asyncio.QueueFull:
+            self._persist_virtual_order_sync(virtual_order_id)
 
     def _generate_virtual_order_id(self) -> str:
         return f"v-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
@@ -267,6 +429,41 @@ class LighterWrapper:
             return float(value)
         except Exception:
             return default
+
+    def _update_price_cache(self, symbol: str, **kwargs) -> None:
+        entry = self._price_cache.get(symbol, {})
+        entry.update(kwargs)
+        entry["ts"] = int(time.time() * 1000)
+        self._price_cache[symbol] = entry
+
+    def get_price_cache(self, symbol: str) -> Optional[dict]:
+        entry = self._price_cache.get(symbol)
+        if not entry:
+            return None
+        now_ms = int(time.time() * 1000)
+        age_sec = (now_ms - entry.get("ts", now_ms)) / 1000.0
+        return {**entry, "age_sec": age_sec, "stale": age_sec > self._price_cache_max_age_sec}
+
+    async def refresh_ticker_cache(self, symbol: str) -> Optional[dict]:
+        data = await self.fetch_ticker(symbol)
+        ticker = data.get("ticker")
+        if ticker:
+            last_trade = self._safe_float(ticker.get("last_trade_price"))
+            if last_trade is not None:
+                self._update_price_cache(symbol, last_trade=last_trade, source="ticker")
+        return self.get_price_cache(symbol)
+
+    async def refresh_order_book_cache(self, symbol: str, limit: int = 1) -> Optional[dict]:
+        data = await self.fetch_order_book_depth(symbol, limit=limit)
+        bids = data.get("bids") or []
+        asks = data.get("asks") or []
+        best_bid = self._safe_float(bids[0].get("price")) if bids else None
+        best_ask = self._safe_float(asks[0].get("price")) if asks else None
+        if best_bid is not None or best_ask is not None:
+            self._update_price_cache(
+                symbol, best_bid=best_bid, best_ask=best_ask, source="order_book"
+            )
+        return self.get_price_cache(symbol)
 
     def _derive_fill_status(self, order: dict) -> dict:
         initial = self._safe_float(
@@ -723,6 +920,8 @@ class LighterWrapper:
                     include_entry=include_entry,
                     match_window_sec=match_window_sec,
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 warnings.warn(f"reconcile_virtual_orders loop error: {e}", RuntimeWarning)
             await asyncio.sleep(interval_sec)
@@ -760,6 +959,61 @@ class LighterWrapper:
             self._reconcile_task.cancel()
             try:
                 await self._reconcile_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _market_cache_loop(
+        self,
+        symbols: list,
+        interval_sec: float,
+        use_ticker: bool,
+        use_order_book: bool,
+        depth_limit: int,
+    ) -> None:
+        while True:
+            try:
+                for symbol in symbols:
+                    if use_ticker:
+                        await self.refresh_ticker_cache(symbol)
+                    if use_order_book:
+                        await self.refresh_order_book_cache(symbol, limit=depth_limit)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                warnings.warn(f"market cache loop error: {e}", RuntimeWarning)
+            await asyncio.sleep(interval_sec)
+
+    def start_market_cache_loop(
+        self,
+        symbols: list,
+        interval_sec: float = 2.0,
+        use_ticker: bool = True,
+        use_order_book: bool = True,
+        depth_limit: int = 1,
+    ) -> None:
+        """
+        start_market_cache_loop: 启动行情缓存轮询
+        """
+        if self._market_cache_task and not self._market_cache_task.done():
+            return
+        self._market_cache_task = asyncio.create_task(
+            self._market_cache_loop(
+                symbols=symbols,
+                interval_sec=interval_sec,
+                use_ticker=use_ticker,
+                use_order_book=use_order_book,
+                depth_limit=depth_limit,
+            )
+        )
+
+    async def stop_market_cache_loop(self) -> None:
+        """
+        stop_market_cache_loop: 停止行情缓存轮询
+        """
+        if self._market_cache_task and not self._market_cache_task.done():
+            self._market_cache_task.cancel()
+            try:
+                await self._market_cache_task
             except asyncio.CancelledError:
                 pass
 
@@ -910,6 +1164,10 @@ class LighterWrapper:
             ticker = details[0]
 
         out = {"code": data.get("code", 200), "ticker": ticker}
+        if ticker:
+            last_trade = self._safe_float(ticker.get("last_trade_price"))
+            if last_trade is not None:
+                self._update_price_cache(symbol, last_trade=last_trade, source="ticker")
         if include_raw:
             out["raw"] = data
         return out
@@ -924,7 +1182,10 @@ class LighterWrapper:
         trades = data.get("trades") or []
         if trades:
             price = trades[0].get("price")
-            return self._safe_float(price)
+            price_val = self._safe_float(price)
+            if price_val is not None:
+                self._update_price_cache(symbol, last_trade=price_val, source="recent_trades")
+            return price_val
 
         ticker = await self.fetch_ticker(symbol)
         if ticker.get("ticker"):
@@ -943,7 +1204,14 @@ class LighterWrapper:
         """
         market_id = await self.get_market_id(symbol)
         res = await self._order_api.order_book_orders(market_id=market_id, limit=limit)
-        return res.to_dict()
+        data = res.to_dict()
+        bids = data.get("bids") or []
+        asks = data.get("asks") or []
+        best_bid = self._safe_float(bids[0].get("price")) if bids else None
+        best_ask = self._safe_float(asks[0].get("price")) if asks else None
+        if best_bid is not None or best_ask is not None:
+            self._update_price_cache(symbol, best_bid=best_bid, best_ask=best_ask, source="order_book")
+        return data
 
     async def get_order_books_metadata(self, symbol: str) -> dict:
         """
@@ -1249,12 +1517,44 @@ class LighterWrapper:
         返回格式示例: 2500.0
         """
         symbol_price_decimals = await self.get_symbol_price_decimals(symbol)
-        last_price = await self.fetch_ohlcv(symbol=symbol, resolution="1m", limit=1)
-        last_close = last_price['c'][-1]['c']
+
+        cached = self.get_price_cache(symbol)
+        if cached is None:
+            try:
+                await self.refresh_order_book_cache(symbol, limit=1)
+            except Exception:
+                pass
+            try:
+                await self.refresh_ticker_cache(symbol)
+            except Exception:
+                pass
+            cached = self.get_price_cache(symbol)
+
+        ref_price = None
+        is_stale = False
+        if cached:
+            is_stale = bool(cached.get("stale"))
+            best_bid = cached.get("best_bid")
+            best_ask = cached.get("best_ask")
+            last_trade = cached.get("last_trade")
+            if side.lower() == "buy":
+                ref_price = best_ask or last_trade or best_bid
+            else:
+                ref_price = best_bid or last_trade or best_ask
+
+        if ref_price is None:
+            warnings.warn(
+                "price cache unavailable, fallback to last close (slow path)",
+                RuntimeWarning,
+            )
+            last_price = await self.fetch_ohlcv(symbol=symbol, resolution="1m", limit=1)
+            ref_price = last_price["c"][-1]["c"]
+            is_stale = True
+
         if side.lower() == "buy":
-            worst_price = last_close * (1 + max_slippage) # 买单取略高于收盘价的价格
+            worst_price = ref_price * (1 + max_slippage)
         else:
-            worst_price = last_close * (1 - max_slippage) # 卖单取略低于收盘价的价格
+            worst_price = ref_price * (1 - max_slippage)
 
         # 价格四舍五入到指定精度
         worst_price = round(worst_price, symbol_price_decimals)
