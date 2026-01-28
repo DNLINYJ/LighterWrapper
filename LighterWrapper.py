@@ -1604,13 +1604,13 @@ class LighterWrapper:
             is_ask_tp_ls = 1
             worst_price = await self.calulate_worst_acceptable_price(symbol, side="buy")
             worst_tp_price = take_profit_price * (1 - max_slippage)  # 止盈价格略低于目标价
-            worst_sl_price = stop_loss_price * (1 + max_slippage)  # 止损价格略高于目标价
+            worst_sl_price = stop_loss_price * (1 - max_slippage) 
         else:  # 空单
             is_ask_ioc = 1
             is_ask_tp_ls = 0
             worst_price = await self.calulate_worst_acceptable_price(symbol, side="sell")
             worst_tp_price = take_profit_price * (1 + max_slippage)  # 止盈价格略高于目标价
-            worst_sl_price = stop_loss_price * (1 - max_slippage)  # 止损价格略低于目标价
+            worst_sl_price = stop_loss_price * (1 + max_slippage)
 
         # https://deepwiki.com/elliottech/lighter-python/6.3-grouped-and-conditional-orders
         # 设置 BaseAmount = 0 此订单会创建一个与持仓规模关联的订单
