@@ -380,8 +380,8 @@ await wrapper.build_books_metadata_cache()
 
 ---
 
-### `await create_market_order_with_tp_sl(symbol, side, quantity, take_profit_price, stop_loss_price, order_expiry=-1) -> (virtual_id, tuple)`
-**说明**：市价单 + TP/SL，返回虚拟单号。
+### `await create_market_order_with_tp_sl(symbol, side, quantity, take_profit_price, stop_loss_price, tp_sl_market=True) -> (virtual_id, tuple)`
+**说明**：市价单 + TP/SL，`tp_sl_market=True` 时 TP/SL 使用市价触发单，否则使用限价触发单。
 
 ---
 

@@ -658,16 +658,19 @@ class LighterWrapper:
         expected = []
 
         if virtual_order.get("order_type") in ("market_with_tp_sl", "limit_with_tp_sl"):
+            tp_sl_market = bool(virtual_order.get("tp_sl_market"))
             expected.append(
                 {
                     "kind": "tp",
                     "side": opposite,
                     "reduce_only": True,
                     "order_types": {
-                        self.signer_instance.ORDER_TYPE_TAKE_PROFIT_LIMIT,
+                        self.signer_instance.ORDER_TYPE_TAKE_PROFIT
+                        if tp_sl_market
+                        else self.signer_instance.ORDER_TYPE_TAKE_PROFIT_LIMIT,
                         "take_profit",
-                        "take_profit_limit",
-                        "tp_limit",
+                        "take_profit_limit" if not tp_sl_market else "take_profit_market",
+                        "tp_limit" if not tp_sl_market else "tp_market",
                     },
                     "price_int": virtual_order.get("tp_price_int"),
                     "price": virtual_order.get("worst_tp_price"),
@@ -681,10 +684,12 @@ class LighterWrapper:
                     "side": opposite,
                     "reduce_only": True,
                     "order_types": {
-                        self.signer_instance.ORDER_TYPE_STOP_LOSS_LIMIT,
+                        self.signer_instance.ORDER_TYPE_STOP_LOSS
+                        if tp_sl_market
+                        else self.signer_instance.ORDER_TYPE_STOP_LOSS_LIMIT,
                         "stop_loss",
-                        "stop_loss_limit",
-                        "sl_limit",
+                        "stop_loss_limit" if not tp_sl_market else "stop_loss_market",
+                        "sl_limit" if not tp_sl_market else "sl_market",
                     },
                     "price_int": virtual_order.get("sl_price_int"),
                     "price": virtual_order.get("worst_sl_price"),
@@ -1573,6 +1578,7 @@ class LighterWrapper:
             quantity: float,
             take_profit_price: float,
             stop_loss_price: float,
+            tp_sl_market: bool = True,
         ) -> tuple:
         """
         create_market_order_with_tp_sl: 创建市价单并设置止盈止损（带虚拟订单号）
@@ -1632,14 +1638,35 @@ class LighterWrapper:
         )
 
         # 创建止盈单和止损单
+        tp_order_type = (
+            self.signer_instance.ORDER_TYPE_TAKE_PROFIT
+            if tp_sl_market
+            else self.signer_instance.ORDER_TYPE_TAKE_PROFIT_LIMIT
+        )
+        tp_tif = (
+            self.signer_instance.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
+            if tp_sl_market
+            else self.signer_instance.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+        )
+        sl_order_type = (
+            self.signer_instance.ORDER_TYPE_STOP_LOSS
+            if tp_sl_market
+            else self.signer_instance.ORDER_TYPE_STOP_LOSS_LIMIT
+        )
+        sl_tif = (
+            self.signer_instance.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
+            if tp_sl_market
+            else self.signer_instance.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+        )
+
         take_profit_order = CreateOrderTxReq(
             MarketIndex=market_id,
             ClientOrderIndex=0,
             BaseAmount=0,
             Price = tp_price_int,
             IsAsk=is_ask_tp_ls, # 和入场单方向相反
-            Type=self.signer_instance.ORDER_TYPE_TAKE_PROFIT_LIMIT,
-            TimeInForce=self.signer_instance.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+            Type=tp_order_type,
+            TimeInForce=tp_tif,
             ReduceOnly=1, # 仅减仓
             TriggerPrice = tp_trigger_int,
             OrderExpiry=-1,
@@ -1651,8 +1678,8 @@ class LighterWrapper:
             BaseAmount=0,
             Price = sl_price_int,
             IsAsk=is_ask_tp_ls,
-            Type=self.signer_instance.ORDER_TYPE_STOP_LOSS_LIMIT,
-            TimeInForce=self.signer_instance.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+            Type=sl_order_type,
+            TimeInForce=sl_tif,
             ReduceOnly=1,
             TriggerPrice = sl_trigger_int,
             OrderExpiry=-1,
@@ -1678,6 +1705,7 @@ class LighterWrapper:
             "tp_trigger_price_int": tp_trigger_int,
             "sl_trigger_price_int": sl_trigger_int,
             "order_type": "market_with_tp_sl",
+            "tp_sl_market": tp_sl_market,
             "market_id": market_id,
             "expected_order_count": 2,
             "status": "created",
