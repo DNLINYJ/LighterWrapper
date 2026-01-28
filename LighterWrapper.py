@@ -1591,7 +1591,7 @@ class LighterWrapper:
             take_profit_price: 止盈价格
             stop_loss_price: 止损价格
             tp_sl_market: 是否使用市价 TP/SL
-            max_slippage: TP/SL 最差价格偏移比例
+            max_slippage: TP/SL 最差价格偏移比例 (默认 0.005 即 0.5%)
 
         返回格式示例: 
             (virtual_order_id, (CreateOrder, RespSendTx, None))     # 成功返回
