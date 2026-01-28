@@ -1798,7 +1798,8 @@ class LighterWrapper:
             "sl_trigger_price_int": sl_trigger_int,
             "order_expiry": order_expiry,
             "order_type": "limit_with_tp_sl",
-            "expected_order_count": 3,
+            # fix: create_limit_order_with_tp_sl_virtual 仍然 expected_order_count = 3（entry + tp + sl），而 reconcile 默认 include_entry=False，所以它会长期 matched_partial
+            "expected_order_count": 2, 
             "status": "created",
         }
         self._persist_virtual_order(virtual_order_id)
