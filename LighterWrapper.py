@@ -1511,7 +1511,7 @@ class LighterWrapper:
         res_tuple = await self.signer_instance.update_leverage(
             market_index=market_id,
             leverage=leverage,
-            mode=mode,
+            margin_mode=mode,
         )
 
         return self._tuple_to_dict(res_tuple)
