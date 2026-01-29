@@ -50,7 +50,7 @@ class LighterWrapper:
         self._reconcile_task: Optional[asyncio.Task] = None
         self._market_cache_task: Optional[asyncio.Task] = None
         self._price_cache: Dict[str, dict] = {}
-        self._price_cache_max_age_sec = 10
+        self._price_cache_max_age_sec = 2
         self._price_cache_fresh_slippage_ticks = 8
         self._price_cache_stale_slippage_ticks = 20
         self._warn_on_precision = False
@@ -994,7 +994,7 @@ class LighterWrapper:
     def start_market_cache_loop(
         self,
         symbols: list,
-        interval_sec: float = 2.0,
+        interval_sec: float = 0.5,
         use_ticker: bool = True,
         use_order_book: bool = True,
         depth_limit: int = 1,
@@ -1542,9 +1542,7 @@ class LighterWrapper:
             cached = self.get_price_cache(symbol)
 
         ref_price = None
-        is_stale = False
         if cached:
-            is_stale = bool(cached.get("stale"))
             best_bid = cached.get("best_bid")
             best_ask = cached.get("best_ask")
             last_trade = cached.get("last_trade")
@@ -1560,7 +1558,6 @@ class LighterWrapper:
             )
             last_price = await self.fetch_ohlcv(symbol=symbol, resolution="1m", limit=1)
             ref_price = last_price["c"][-1]["c"]
-            is_stale = True
 
         if side.lower() == "buy":
             worst_price = ref_price * (1 + max_slippage)
