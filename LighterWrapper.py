@@ -1556,8 +1556,19 @@ class LighterWrapper:
                 "price cache unavailable, fallback to last close (slow path)",
                 RuntimeWarning,
             )
-            last_price = await self.fetch_ohlcv(symbol=symbol, resolution="1m", limit=1)
-            ref_price = last_price["c"][-1]["c"]
+            # last_price = await self.fetch_ohlcv(symbol=symbol, resolution="1m", limit=1)
+            # ref_price = last_price["c"][-1]["c"]
+            # 改用盘口深度的 best bid/ask 作为参考价
+            order_book = await self.fetch_order_book_depth(symbol, limit=1)
+            bids = order_book.get("bids") or []
+            asks = order_book.get("asks") or []
+            best_bid = self._safe_float(bids[0].get("price")) if bids else None
+            best_ask = self._safe_float(asks[0].get("price")) if asks else None
+            
+            if side.lower() == "buy":
+                ref_price = best_ask or best_bid
+            else:
+                ref_price = best_bid or best_ask
 
         if side.lower() == "buy":
             worst_price = ref_price * (1 + max_slippage)
@@ -1589,7 +1600,7 @@ class LighterWrapper:
             take_profit_price: 止盈价格
             stop_loss_price: 止损价格
             tp_sl_market: 是否使用市价 TP/SL
-            max_slippage: TP/SL 最差价格偏移比例 (默认 0.001 即 0.1%)
+            max_slippage: TP/SL 最差价格偏移比例 (默认 0.001 即 0.1%, 最大值为 0.05)
 
         返回格式示例: 
             (virtual_order_id, (CreateOrder, RespSendTx, None))     # 成功返回
@@ -1597,18 +1608,19 @@ class LighterWrapper:
         """
         market_id = await self.get_market_id(symbol)
 
+        # 最大滑点 5% https://docs.lighter.xyz/perpetual-futures/orders-and-matching
         if side.lower() == "buy": # 多单
             is_ask_ioc = 0
             is_ask_tp_ls = 1
-            worst_price = await self.calulate_worst_acceptable_price(symbol, side="buy", max_slippage=max_slippage)
-            worst_tp_price = take_profit_price * (1 - max_slippage)  # 止盈价格略低于目标价
-            worst_sl_price = stop_loss_price * (1 - max_slippage) 
+            worst_price = await self.calulate_worst_acceptable_price(symbol, side="buy", max_slippage=min(max_slippage, 0.05))
+            worst_tp_price = take_profit_price * (1 - min(max_slippage, 0.05))  # 止盈价格略低于目标价
+            worst_sl_price = stop_loss_price * (1 - min(max_slippage, 0.05)) 
         else:  # 空单
             is_ask_ioc = 1
             is_ask_tp_ls = 0
-            worst_price = await self.calulate_worst_acceptable_price(symbol, side="sell", max_slippage=max_slippage)
-            worst_tp_price = take_profit_price * (1 + max_slippage)  # 止盈价格略高于目标价
-            worst_sl_price = stop_loss_price * (1 + max_slippage)
+            worst_price = await self.calulate_worst_acceptable_price(symbol, side="sell", max_slippage=min(max_slippage, 0.05))
+            worst_tp_price = take_profit_price * (1 + min(max_slippage, 0.05))  # 止盈价格略高于目标价
+            worst_sl_price = stop_loss_price * (1 + min(max_slippage, 0.05))
 
         # https://deepwiki.com/elliottech/lighter-python/6.3-grouped-and-conditional-orders
         # 设置 BaseAmount = 0 此订单会创建一个与持仓规模关联的订单
@@ -1731,7 +1743,8 @@ class LighterWrapper:
             side: str,
             quantity: float,
             reduce_only: bool,
-            custom_order_index: int = 0
+            custom_order_index: int = 0,
+            max_slippage: float = 0.001,
         ) -> tuple:
         """
         create_market_order: 创建市价单
@@ -1742,6 +1755,7 @@ class LighterWrapper:
             quantity: 交易数量 (交易币种) 如 0.1 ETH
             reduce_only: 是否为仅减仓单
             custom_order_index: 自定义订单索引, 默认为 0
+            max_slippage: 最大滑点比例 (默认 0.001 即 0.1%, 最大值为 0.05)
 
         返回格式示例: 
             (CreateOrder, RespSendTx, None)     # 成功返回
@@ -1751,10 +1765,10 @@ class LighterWrapper:
 
         if side.lower() == "buy":
             is_ask = 0
-            worst_price = await self.calulate_worst_acceptable_price(symbol, side="buy")
+            worst_price = await self.calulate_worst_acceptable_price(symbol, side="buy", max_slippage=min(max_slippage, 0.05))
         else:
             is_ask = 1
-            worst_price = await self.calulate_worst_acceptable_price(symbol, side="sell")
+            worst_price = await self.calulate_worst_acceptable_price(symbol, side="sell", max_slippage=min(max_slippage, 0.05))
 
         res_tuple = await self.signer_instance.create_market_order(
             market_index=market_id,
@@ -1996,13 +2010,14 @@ class LighterWrapper:
         )
         return self._tuple_to_dict(res_tuple)
     
-    async def close_all_positions_for_symbol(self, symbol: str) -> tuple:
+    async def close_all_positions_for_symbol(self, symbol: str, max_slippage: float = 0.001) -> tuple:
         """ 
         close_all_positions_for_symbol: 市价单平仓指定交易对的所有持仓
 
         参数:
             symbol: 交易对符号, 如 "BTC"
-            
+            max_slippage: 最大滑点比例 (默认 0.001 即 0.1%, 最大值为 0.05)
+
         返回格式示例:
             (CreateOrder, RespSendTx, None)     # 成功返回
             (None, None, error_string)          # 失败返回
@@ -2019,10 +2034,10 @@ class LighterWrapper:
 
         if side == 1:  # 多头平仓 -> 卖
             is_ask = 1 
-            worst_price = await self.calulate_worst_acceptable_price(symbol, side="sell")
+            worst_price = await self.calulate_worst_acceptable_price(symbol, side="sell", max_slippage=min(max_slippage, 0.05))
         else:          # 空头平仓 -> 买
             is_ask = 0
-            worst_price = await self.calulate_worst_acceptable_price(symbol, side="buy")
+            worst_price = await self.calulate_worst_acceptable_price(symbol, side="buy", max_slippage=min(max_slippage, 0.05))
 
         qty = abs(pos)
 
