@@ -10,13 +10,34 @@ from LighterWrapper import APIConfig, LighterWrapper
 async def main():
     config = APIConfig(
         base_url="https://mainnet.zklighter.elliot.ai",
-        api_secret_key={709464: "YOUR_PRIVATE_KEY"},
-        account_index=709464,
+        api_secret_key={YOUR_PRIVATE_KEY_INDEX: "YOUR_PRIVATE_KEY"},
+        account_index=YOUR_ACCOUNT_INDEX,
     )
 
     wrapper = LighterWrapper(config)
+
+    # 开启缓存
+    print("[初始化] 启动订单同步循环...")
+    wrapper.start_reconcile_loop(
+        interval_sec=3, # 每 3 秒同步一次虚拟订单
+        symbols=["BTC"], # 同步的交易对列表
+        include_closed=True,
+        closed_limit=100,
+    )
+
+    # 行情缓存 Loop
+    wrapper.start_market_cache_loop(
+        symbols=["BTC"], # 同步的交易对列表
+        interval_sec=0.5, # 每 0.5 秒更新一次行情缓存
+        use_ticker=True,
+        use_order_book=True,
+        depth_limit=1,
+    )
+
+    # 热构建交易对 -> market_id 缓存
+    await wrapper.build_books_metadata_cache()
+
     try:
-        await wrapper.build_market_id_symbol_map()
         account = await wrapper.get_account()
         positions = await wrapper.get_positions_by_symbol("BTC")
         ohlcv = await wrapper.fetch_ohlcv("BTC", resolution="1m", limit=10)
