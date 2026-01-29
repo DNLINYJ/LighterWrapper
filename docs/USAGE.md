@@ -17,7 +17,6 @@ async def main():
     wrapper = LighterWrapper(config)
 
     # 开启缓存
-    print("[初始化] 启动订单同步循环...")
     wrapper.start_reconcile_loop(
         interval_sec=3, # 每 3 秒同步一次虚拟订单
         symbols=["BTC"], # 同步的交易对列表
