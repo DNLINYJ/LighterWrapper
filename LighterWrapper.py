@@ -48,11 +48,6 @@ class LighterWrapper:
         self._init_virtual_orders_db()
         self._load_virtual_orders()
         self._reconcile_task: Optional[asyncio.Task] = None
-        self._market_cache_task: Optional[asyncio.Task] = None
-        self._price_cache: Dict[str, dict] = {}
-        self._price_cache_max_age_sec = 2
-        self._price_cache_fresh_slippage_ticks = 8
-        self._price_cache_stale_slippage_ticks = 20
         self._warn_on_precision = False
 
         self.books_metadatas_cache = dict()  # 订单簿元数据缓存 用于加速获取 market_id 和 换算精度
@@ -115,7 +110,6 @@ class LighterWrapper:
 
     async def _close(self):
         await self._cancel_task(self._reconcile_task, "reconcile_loop")
-        await self._cancel_task(self._market_cache_task, "market_cache_loop")
         await self._stop_db_writer(fast_exit=True)
         await self._await_with_timeout(self.api_client.close(), "api_client.close")
         await self._await_with_timeout(self.signer_instance.close(), "signer_instance.close")
@@ -432,41 +426,6 @@ class LighterWrapper:
             return float(value)
         except Exception:
             return default
-
-    def _update_price_cache(self, symbol: str, **kwargs) -> None:
-        entry = self._price_cache.get(symbol, {})
-        entry.update(kwargs)
-        entry["ts"] = int(time.time() * 1000)
-        self._price_cache[symbol] = entry
-
-    def get_price_cache(self, symbol: str) -> Optional[dict]:
-        entry = self._price_cache.get(symbol)
-        if not entry:
-            return None
-        now_ms = int(time.time() * 1000)
-        age_sec = (now_ms - entry.get("ts", now_ms)) / 1000.0
-        return {**entry, "age_sec": age_sec, "stale": age_sec > self._price_cache_max_age_sec}
-
-    async def refresh_ticker_cache(self, symbol: str) -> Optional[dict]:
-        data = await self.fetch_ticker(symbol)
-        ticker = data.get("ticker")
-        if ticker:
-            last_trade = self._safe_float(ticker.get("last_trade_price"))
-            if last_trade is not None:
-                self._update_price_cache(symbol, last_trade=last_trade, source="ticker")
-        return self.get_price_cache(symbol)
-
-    async def refresh_order_book_cache(self, symbol: str, limit: int = 1) -> Optional[dict]:
-        data = await self.fetch_order_book_depth(symbol, limit=limit)
-        bids = data.get("bids") or []
-        asks = data.get("asks") or []
-        best_bid = self._safe_float(bids[0].get("price")) if bids else None
-        best_ask = self._safe_float(asks[0].get("price")) if asks else None
-        if best_bid is not None or best_ask is not None:
-            self._update_price_cache(
-                symbol, best_bid=best_bid, best_ask=best_ask, source="order_book"
-            )
-        return self.get_price_cache(symbol)
 
     def _derive_fill_status(self, order: dict) -> dict:
         initial = self._safe_float(
@@ -970,61 +929,6 @@ class LighterWrapper:
             except asyncio.CancelledError:
                 pass
 
-    async def _market_cache_loop(
-        self,
-        symbols: list,
-        interval_sec: float,
-        use_ticker: bool,
-        use_order_book: bool,
-        depth_limit: int,
-    ) -> None:
-        while True:
-            try:
-                for symbol in symbols:
-                    if use_ticker:
-                        await self.refresh_ticker_cache(symbol)
-                    if use_order_book:
-                        await self.refresh_order_book_cache(symbol, limit=depth_limit)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                warnings.warn(f"market cache loop error: {e}", RuntimeWarning)
-            await asyncio.sleep(interval_sec)
-
-    def start_market_cache_loop(
-        self,
-        symbols: list,
-        interval_sec: float = 0.5,
-        use_ticker: bool = True,
-        use_order_book: bool = True,
-        depth_limit: int = 1,
-    ) -> None:
-        """
-        start_market_cache_loop: 启动行情缓存轮询
-        """
-        if self._market_cache_task and not self._market_cache_task.done():
-            return
-        self._market_cache_task = asyncio.create_task(
-            self._market_cache_loop(
-                symbols=symbols,
-                interval_sec=interval_sec,
-                use_ticker=use_ticker,
-                use_order_book=use_order_book,
-                depth_limit=depth_limit,
-            )
-        )
-
-    async def stop_market_cache_loop(self) -> None:
-        """
-        stop_market_cache_loop: 停止行情缓存轮询
-        """
-        if self._market_cache_task and not self._market_cache_task.done():
-            self._market_cache_task.cancel()
-            try:
-                await self._market_cache_task
-            except asyncio.CancelledError:
-                pass
-
     async def _get_http_session(self) -> aiohttp.ClientSession:
         if self._http_session is None or self._http_session.closed:
             self._http_session = aiohttp.ClientSession(timeout=self._http_timeout)
@@ -1174,10 +1078,6 @@ class LighterWrapper:
             ticker = details[0]
 
         out = {"code": data.get("code", 200), "ticker": ticker}
-        if ticker:
-            last_trade = self._safe_float(ticker.get("last_trade_price"))
-            if last_trade is not None:
-                self._update_price_cache(symbol, last_trade=last_trade, source="ticker")
         if include_raw:
             out["raw"] = data
         return out
@@ -1193,8 +1093,6 @@ class LighterWrapper:
         if trades:
             price = trades[0].get("price")
             price_val = self._safe_float(price)
-            if price_val is not None:
-                self._update_price_cache(symbol, last_trade=price_val, source="recent_trades")
             return price_val
 
         ticker = await self.fetch_ticker(symbol)
@@ -1215,12 +1113,6 @@ class LighterWrapper:
         market_id = await self.get_market_id(symbol)
         res = await self._order_api.order_book_orders(market_id=market_id, limit=limit)
         data = res.to_dict()
-        bids = data.get("bids") or []
-        asks = data.get("asks") or []
-        best_bid = self._safe_float(bids[0].get("price")) if bids else None
-        best_ask = self._safe_float(asks[0].get("price")) if asks else None
-        if best_bid is not None or best_ask is not None:
-            self._update_price_cache(symbol, best_bid=best_bid, best_ask=best_ask, source="order_book")
         return data
 
     async def get_order_books_metadata(self, symbol: str) -> dict:
@@ -1529,46 +1421,33 @@ class LighterWrapper:
         """
         symbol_price_decimals = await self.get_symbol_price_decimals(symbol)
 
-        cached = self.get_price_cache(symbol)
-        if cached is None:
-            try:
-                await self.refresh_order_book_cache(symbol, limit=1)
-            except Exception:
-                pass
-            try:
-                await self.refresh_ticker_cache(symbol)
-            except Exception:
-                pass
-            cached = self.get_price_cache(symbol)
-
         ref_price = None
-        if cached:
-            best_bid = cached.get("best_bid")
-            best_ask = cached.get("best_ask")
-            last_trade = cached.get("last_trade")
-            if side.lower() == "buy":
-                ref_price = best_ask or last_trade or best_bid
-            else:
-                ref_price = best_bid or last_trade or best_ask
-
-        if ref_price is None:
-            warnings.warn(
-                "price cache unavailable, fallback to last close (slow path)",
-                RuntimeWarning,
-            )
-            # last_price = await self.fetch_ohlcv(symbol=symbol, resolution="1m", limit=1)
-            # ref_price = last_price["c"][-1]["c"]
-            # 改用盘口深度的 best bid/ask 作为参考价
+        try:
             order_book = await self.fetch_order_book_depth(symbol, limit=1)
             bids = order_book.get("bids") or []
             asks = order_book.get("asks") or []
             best_bid = self._safe_float(bids[0].get("price")) if bids else None
             best_ask = self._safe_float(asks[0].get("price")) if asks else None
-            
             if side.lower() == "buy":
                 ref_price = best_ask or best_bid
             else:
                 ref_price = best_bid or best_ask
+        except Exception:
+            pass
+
+        if ref_price is None:
+            try:
+                ref_price = await self.get_latest_price(symbol)
+            except Exception:
+                ref_price = None
+
+        if ref_price is None:
+            warnings.warn(
+                "price unavailable, fallback to last close (slow path)",
+                RuntimeWarning,
+            )
+            last_price = await self.fetch_ohlcv(symbol=symbol, resolution="1m", limit=1)
+            ref_price = last_price["c"][-1]["c"]
 
         if side.lower() == "buy":
             worst_price = ref_price * (1 + max_slippage)

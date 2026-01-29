@@ -78,7 +78,6 @@ async def main() -> None:
     run_market = os.getenv("RUN_MARKET_TESTS", "0") == "1"
     run_close_positions = os.getenv("RUN_CLOSE_POSITIONS", "0") == "1"
     run_reconcile_loop = os.getenv("RUN_RECONCILE_LOOP", "0") == "1"
-    run_market_cache_loop = os.getenv("RUN_MARKET_CACHE_LOOP", "0") == "1"
 
     symbol = os.getenv("LIGHTER_TEST_SYMBOL", "BTC")
     test_qty = float(os.getenv("LIGHTER_TEST_QTY", "0.001"))
@@ -86,7 +85,6 @@ async def main() -> None:
     tp_multiplier = float(os.getenv("LIGHTER_TP_MULTIPLIER", "1.05"))
     sl_multiplier = float(os.getenv("LIGHTER_SL_MULTIPLIER", "0.95"))
     reconcile_interval = float(os.getenv("RECONCILE_LOOP_INTERVAL", "5"))
-    market_cache_interval = float(os.getenv("MARKET_CACHE_LOOP_INTERVAL", "2"))
 
     wrapper = LighterWrapper(config)
     try:
@@ -147,15 +145,6 @@ async def main() -> None:
                 symbols=[symbol],
                 include_closed=True,
                 closed_limit=100,
-            )
-        if run_market_cache_loop:
-            _section("行情缓存 Loop")
-            wrapper.start_market_cache_loop(
-                symbols=[symbol],
-                interval_sec=market_cache_interval,
-                use_ticker=True,
-                use_order_book=True,
-                depth_limit=1,
             )
 
         if not run_trading:
@@ -249,8 +238,6 @@ async def main() -> None:
             close_res = await wrapper.close_all_positions_for_symbol(symbol)
             _print_json("close_all_positions_for_symbol", close_res)
     finally:
-        if run_market_cache_loop:
-            await wrapper.stop_market_cache_loop()
         if run_reconcile_loop:
             await wrapper.stop_reconcile_loop()
         await wrapper._close()

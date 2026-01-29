@@ -159,36 +159,6 @@ await wrapper.build_books_metadata_cache()
 
 ---
 
-### `get_price_cache(symbol: str) -> Optional[dict]`
-**说明**：读取本地行情缓存（不会发请求）。
-
-**返回示例**
-```json
-{"last_trade": 88000.0, "best_bid": 87999.9, "best_ask": 88000.1, "age_sec": 0.5, "stale": false}
-```
-
----
-
-### `await refresh_ticker_cache(symbol: str) -> Optional[dict]`
-**说明**：拉取 ticker 并更新缓存。
-
----
-
-### `await refresh_order_book_cache(symbol: str, limit: int = 1) -> Optional[dict]`
-**说明**：拉取盘口并更新 best_bid / best_ask 缓存。
-
----
-
-### `start_market_cache_loop(symbols: list, interval_sec=2.0, use_ticker=True, use_order_book=True, depth_limit=1) -> None`
-**说明**：后台轮询行情缓存（建议用于热路径下单）。
-
----
-
-### `await stop_market_cache_loop() -> None`
-**说明**：停止行情缓存轮询。
-
----
-
 ## 账户 / 持仓
 
 ### `await get_account() -> dict`
@@ -415,8 +385,7 @@ await wrapper.build_books_metadata_cache()
 ---
 
 ### `await calulate_worst_acceptable_price(symbol, side, max_slippage=0.005) -> float`
-**说明**：基于**行情缓存**计算最差可接受价格；使用 `max_slippage` 直接乘价计算；若无缓存，回退到 1m close（慢路径）。
-
+**Note**: Calculates worst acceptable price from order book or latest trade; falls back to 1m close (slow path) when unavailable.
 ---
 
 ## 常见调用示例

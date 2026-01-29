@@ -16,21 +16,12 @@ async def main():
 
     wrapper = LighterWrapper(config)
 
-    # 开启缓存
+    # 开启自动匹配 loop
     wrapper.start_reconcile_loop(
         interval_sec=3, # 每 3 秒同步一次虚拟订单
         symbols=["BTC"], # 同步的交易对列表
         include_closed=True,
         closed_limit=100,
-    )
-
-    # 行情缓存 Loop
-    wrapper.start_market_cache_loop(
-        symbols=["BTC"], # 同步的交易对列表
-        interval_sec=0.5, # 每 0.5 秒更新一次行情缓存
-        use_ticker=True,
-        use_order_book=True,
-        depth_limit=1,
     )
 
     # 热构建交易对 -> market_id 缓存
@@ -112,17 +103,4 @@ status = await wrapper.get_order_status(
 wrapper.start_reconcile_loop(interval_sec=5, symbols=["BTC"])
 # ...
 await wrapper.stop_reconcile_loop()
-```
-
-## 7. 行情缓存轮询（热路径下单推荐）
-```python
-wrapper.start_market_cache_loop(
-    symbols=["BTC"],
-    interval_sec=2.0,
-    use_ticker=True,
-    use_order_book=True,
-    depth_limit=1,
-)
-# ...
-await wrapper.stop_market_cache_loop()
 ```
